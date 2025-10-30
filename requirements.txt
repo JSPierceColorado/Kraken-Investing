@@ -1,8 +1,7 @@
 gspread==6.1.2
 google-auth==2.34.0
-pandas==2.2.2
-pandas-ta==0.4.71b0
-numpy>=2.2.6
+pandas==2.3.2
+numpy>=2.3.0
 requests==2.32.3
 python-dateutil==2.9.0.post0
 nltk==3.9.1
