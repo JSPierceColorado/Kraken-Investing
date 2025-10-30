@@ -1,365 +1,442 @@
 """
-STOCKTWITS-FIRST PIPELINE (resilient discovery, no preloaded tickers)
+Kraken Tracker & Seller (Perpetual loop, trailing take profit)
 
-Flow
-----
-1) Discover crypto symbols from Stocktwits:
-   - Seed with /trending/symbols.json
-   - Expand via throttled /search/symbols.json sweeps over A..Z and 0..9
-   - Keep only crypto-like results (type contains 'crypto' or symbol ends with '.X')
-2) Write discovery inventory to Google Sheet: Active-Investing → Crypto-Scrape
-3) For each discovered symbol (slug):
-   - Fetch messages from Stocktwits (search-first to confirm slug → stream)
-   - If messages > 0, compute VADER averages
-   - Map slug to Kraken base (strip '.X'; XBT/DOGE normalization) and fetch OHLC(60m)
-   - Compute RSI(14), EMA(20), SMA(50), simple momentum
-   - If any step fails → EXCLUDE the symbol
-4) Write only fully successful rows to Active-Investing → Crypto-Sentiment
+Sheet (tab: Kraken Integration)
+-------------------------------
+A: Symbol
+B: P/L %
+C: Quantity
+D: Avg Cost (quote)
+E: Last Price (quote)
+F: Armed (TRUE/FALSE)
+G: High P/L % (since armed)
+H: Status (e.g., HOLD / ARMED / SOLD / STOP_LOSS)
+I: Last Update (UTC ISO)
+J: Notes (last action / errors)
 
-Env
----
+Trading rules
+-------------
+- Stop loss: if P/L% <= LOSS_THRESHOLD (default -3), SELL 100%
+- Trailing take profit:
+  - If P/L% >= ARM_THRESHOLD (default +5), set Armed=TRUE and High=P/L%
+  - While Armed, update High on new highs; if P/L% <= High - TRAIL_GIVEBACK (default 2), SELL 100%
+
+Env Vars
+--------
+KRAKEN_API_KEY, KRAKEN_API_SECRET
 GOOGLE_CREDS_JSON
-GOOGLE_SHEET_NAME   (default "Active-Investing")
-SHEET_TICKERS_TAB   (default "Crypto-Scrape")
-SHEET_SENTIMENT_TAB (default "Crypto-Sentiment")
-KRAKEN_BASE_PAIR    (default "USD")
-HTTP_TIMEOUT        (default 20)
-MAX_STW_SYMBOLS     (default 600)   # cap for discovery list to avoid rate limits
-MESSAGES_PER_SYMBOL (default 30)
-BASE_SLEEP_SEC      (default 0.35)  # base pacing between calls
-MAX_RETRIES         (default 3)     # retries for 429/5xx
-MAX_TICKERS         (optional, if you want to hard-cap post-discovery processing)
+GOOGLE_SHEET_NAME      (default: Active-Investing)
+SHEET_KRAKEN_TAB       (default: Kraken Integration)
+QUOTE_CCY              (default: USD)
+LOSS_THRESHOLD         (default: -3)      # percent
+ARM_THRESHOLD          (default: 5)       # percent
+TRAIL_GIVEBACK         (default: 2)       # percent
+INTERVAL_SEC           (default: 300)     # sleep between loops
+LIVE_TRADING           (default: false)   # true to place real orders
 """
 
 from __future__ import annotations
 
-import os, json, re, time, math, logging
-from typing import Dict, List, Optional, Set
+import os
+import json
+import time
+import hmac
+import hashlib
+import base64
+import logging
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
 import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
+import krakenex
 
-# --- Sentiment (VADER) ---
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
-try:
-    nltk.data.find("sentiment/vader_lexicon")
-except LookupError:
-    nltk.download("vader_lexicon")
-
-# --------------------------
-# Config
-# --------------------------
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-DEFAULT_SHEET = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-TICKERS_TAB = os.getenv("SHEET_TICKERS_TAB", "Crypto-Scrape")
-SENTIMENT_TAB = os.getenv("SHEET_SENTIMENT_TAB", "Crypto-Sentiment")
-BASE_PAIR = os.getenv("KRAKEN_BASE_PAIR", "USD").upper()
-
-MAX_STW_SYMBOLS = int(os.getenv("MAX_STW_SYMBOLS", "600"))
-MESSAGES_PER_SYMBOL = int(os.getenv("MESSAGES_PER_SYMBOL", "30"))
-BASE_SLEEP_SEC = float(os.getenv("BASE_SLEEP_SEC", "0.35"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "0"))  # 0 = no cap
-
+# ---------- Config ----------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-def log(msg: str): print(msg, flush=True)
 
-# --------------------------
-# Google Sheets
-# --------------------------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
+SHEET_KRAKEN_TAB = os.getenv("SHEET_KRAKEN_TAB", "Kraken Integration")
+QUOTE_CCY = os.getenv("QUOTE_CCY", "USD").upper()
 
+LOSS_THRESHOLD = float(os.getenv("LOSS_THRESHOLD", "-3"))
+ARM_THRESHOLD = float(os.getenv("ARM_THRESHOLD", "5"))
+TRAIL_GIVEBACK = float(os.getenv("TRAIL_GIVEBACK", "2"))
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "300"))
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+
+KRAKEN_KEY = os.getenv("KRAKEN_API_KEY", "")
+KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET", "")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# Map for Kraken base asset codes <-> common symbols
+KRKN_BASE_TO_COMMON = {"XBT": "BTC", "XDG": "DOGE"}
+COMMON_TO_KRKN_BASE = {"BTC": "XBT", "DOGE": "XDG"}
+
+# ---------- Helpers ----------
+def now_iso() -> str:
+    return pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def to_float(x) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+# ---------- Google Sheets ----------
 class SheetClient:
     def __init__(self, sheet_name: str):
         creds_json = os.getenv("GOOGLE_CREDS_JSON")
-        if not creds_json: raise RuntimeError("GOOGLE_CREDS_JSON is missing.")
+        if not creds_json:
+            raise RuntimeError("GOOGLE_CREDS_JSON missing")
         sa_info = json.loads(creds_json)
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
         self.sheet = self.gc.open(sheet_name)
 
-    def clear_and_write(self, tab: str, rows: List[List]):
+    def read_tab(self, tab: str) -> pd.DataFrame:
         try:
             ws = self.sheet.worksheet(tab)
         except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=tab, rows="5000", cols="26")
+            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="20")
+        data = ws.get_all_values()
+        if not data:
+            return pd.DataFrame()
+        header, *rows = data
+        if not header:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=header)
+        return df
+
+    def write_tab(self, tab: str, rows: List[List]):
+        try:
+            ws = self.sheet.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="20")
         ws.clear()
         if rows:
-            ws.update(rows, "A1", value_input_option="RAW")  # values first (no deprecation)
+            # values first, then range (deprecation-safe)
+            ws.update(rows, "A1", value_input_option="RAW")
 
-# --------------------------
-# Kraken API
-# --------------------------
+# ---------- Kraken ----------
 class KrakenClient:
-    BASE = "https://api.kraken.com/0/public"
+    PUBLIC = "https://api.kraken.com/0/public"
+    PRIVATE = "https://api.kraken.com/0/private"
 
-    def _get(self, path: str, params: Optional[dict] = None):
-        r = requests.get(f"{self.BASE}/{path}", params=params or {}, timeout=HTTP_TIMEOUT)
+    def __init__(self, key: str, secret: str):
+        self.api = krakenex.API(key, secret)
+        self.session = requests.Session()
+
+    # --------- Public ---------
+    def get_asset_pairs(self) -> dict:
+        r = self.session.get(f"{self.PUBLIC}/AssetPairs", timeout=20)
         r.raise_for_status()
-        data = r.json()
-        if data.get("error"): raise RuntimeError(f"Kraken error: {data['error']}")
-        return data["result"]
+        res = r.json()
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        return res["result"]
 
-    def get_ohlc_for_symbol(self, base_symbol: str, quote: str = "USD", interval: int = 60) -> Optional[pd.DataFrame]:
-        # Map common aliases
-        kraken_base = {"BTC":"XBT","DOGE":"XDG"}.get(base_symbol.upper(), base_symbol.upper())
-        pair = f"{kraken_base}{quote.upper()}"
-        try:
-            data = self._get("OHLC", params={"pair": pair, "interval": interval})
-            if not data: return None
-            keys = [k for k in data.keys() if k != "last"]
-            if not keys: return None
-            rows = data.get(keys[0], [])
-            if not rows: return None
-            df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
-            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
-            df.set_index("time", inplace=True)
-            for c in ["open","high","low","close","vwap","volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df
-        except Exception as e:
-            logging.info("Kraken OHLC fail for %s/%s: %s", base_symbol, quote, e)
-            return None
+    def ticker(self, pairs: List[str]) -> dict:
+        # pairs must be comma-separated altnames like XBTUSD
+        params = {"pair": ",".join(pairs)}
+        r = self.session.get(f"{self.PUBLIC}/Ticker", params=params, timeout=20)
+        r.raise_for_status()
+        res = r.json()
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        return res["result"]
 
-# --------------------------
-# Stocktwits (resilient discovery + fetch)
-# --------------------------
-SYMBOL_RE = re.compile(r"(?=.*[A-Z])[A-Z0-9]{2,10}$")
-FIAT = {"USD","EUR","AUD","GBP","JPY","CAD","CHF","CNY","CNH","NZD","SEK","NOK","DKK","HKD","SGD","ZAR","MXN"}
+    # --------- Private (via krakenex) ---------
+    def balance(self) -> dict:
+        res = self.api.query_private("Balance")
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        return res["result"]
 
-def looks_crypto(sym_obj: dict) -> bool:
-    sym = (sym_obj.get("symbol") or "").upper()
-    typ = (sym_obj.get("type") or "").lower()
-    if sym.endswith(".X"):             # common Stocktwits crypto suffix
-        return True
-    if "crypto" in typ:                # e.g., "cryptocurrency"
-        return True
-    return False
+    def trades_history(self) -> dict:
+        # you can paginate if needed; this fetches recent history by default
+        res = self.api.query_private("TradesHistory", {"trades": True})
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        return res["result"]["trades"]
 
-class StocktwitsClient:
-    BASE = "https://api.stocktwits.com/api/2"
-    def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; CryptoBot/1.0; +https://example.com)",
-            "Accept": "application/json",
-        })
+    def add_order_market_sell(self, pair_altname: str, volume: float) -> dict:
+        payload = {
+            "pair": pair_altname,   # e.g., XBTUSD
+            "type": "sell",
+            "ordertype": "market",
+            "volume": str(volume)
+        }
+        res = self.api.query_private("AddOrder", payload)
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        return res["result"]
 
-    def _get(self, path: str, params: Optional[dict]=None, *, allow_retry: bool=True) -> Optional[dict]:
-        """GET with retry/backoff on 429/5xx."""
-        url = f"{self.BASE}/{path}"
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                r = self.s.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
-                code = r.status_code
-                if code == 200:
-                    return r.json()
-                # retry on 429 and 5xx
-                if allow_retry and (code == 429 or 500 <= code < 600):
-                    sleep_s = BASE_SLEEP_SEC * (2 ** (attempt - 1))
-                    logging.info("Stocktwits %s -> %s; retrying in %.2fs (attempt %d/%d)",
-                                 path, code, sleep_s, attempt, MAX_RETRIES)
-                    time.sleep(sleep_s)
-                    continue
-                logging.info("Stocktwits %s -> HTTP %s (no retry)", path, code)
-                return None
-            except Exception as e:
-                if allow_retry and attempt < MAX_RETRIES:
-                    sleep_s = BASE_SLEEP_SEC * (2 ** (attempt - 1))
-                    logging.info("Stocktwits %s error %s; retrying in %.2fs (attempt %d/%d)",
-                                 path, e, sleep_s, attempt, MAX_RETRIES)
-                    time.sleep(sleep_s)
-                    continue
-                logging.info("Stocktwits %s error (final): %s", path, e)
-                return None
-        return None
+# ---------- Pair mapping & pricing ----------
+def build_pair_maps(asset_pairs: dict, quote_ccy: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Returns:
+      base_to_altpair: map common base symbol (BTC) -> pair altname (XBTUSD)
+      altpair_to_base: reverse map altname -> common base symbol
+    Only pairs quoted in `quote_ccy` are considered.
+    """
+    quote_ccy = quote_ccy.upper()
+    base_to_altpair: Dict[str, str] = {}
+    altpair_to_base: Dict[str, str] = {}
+    for key, info in asset_pairs.items():
+        altname = info.get("altname")      # e.g., XBTUSD
+        wsname = info.get("wsname")        # e.g., XBT/USD
+        if not altname or not wsname or "/" not in wsname:
+            continue
+        base, quote = wsname.split("/")
+        if quote.upper() != quote_ccy:
+            continue
+        common = KRKN_BASE_TO_COMMON.get(base.upper(), base.upper())  # XBT->BTC, XDG->DOGE
+        base_to_altpair[common] = altname
+        altpair_to_base[altname] = common
+    return base_to_altpair, altpair_to_base
 
-    def trending_symbols(self) -> List[str]:
-        data = self._get("trending/symbols.json")
-        out: List[str] = []
-        if not data: return out
-        for s in data.get("symbols", []) or []:
-            if looks_crypto(s):
-                sym = (s.get("symbol") or "").upper()
-                if SYMBOL_RE.fullmatch(sym) and sym not in FIAT:
-                    out.append(sym)
-        time.sleep(BASE_SLEEP_SEC)
-        return out
-
-    def search_symbols(self, q: str) -> List[str]:
-        data = self._get("search/symbols.json", {"q": q})
-        out: List[str] = []
-        if not data: return out
-        for s in data.get("symbols", []) or []:
-            if looks_crypto(s):
-                sym = (s.get("symbol") or "").upper()
-                if SYMBOL_RE.fullmatch(sym) and sym not in FIAT:
-                    out.append(sym)
-        time.sleep(BASE_SLEEP_SEC)
-        return out
-
-    def discover_crypto_symbols(self, cap: int = 600) -> List[str]:
-        """Trending seed + throttled alphanumeric search sweep until cap."""
-        seen: Set[str] = set()
-        out: List[str] = []
-
-        # 1) seed with trending
-        for sym in self.trending_symbols():
-            if sym not in seen:
-                seen.add(sym); out.append(sym)
-                if len(out) >= cap: return out
-
-        # 2) search sweep A..Z and 0..9 (throttled)
-        queries = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        for q in queries:
-            for sym in self.search_symbols(q):
-                if sym not in seen:
-                    seen.add(sym); out.append(sym)
-                    if len(out) >= cap: return out
-        return out
-
-    # per-symbol: confirm slug via search, then pull stream
-    def find_slug_for_symbol(self, raw: str) -> Optional[str]:
-        # Many crypto slugs on STW end with ".X"
-        # Search raw, then try raw+".X" if exact isn't returned by search
-        data = self._get("search/symbols.json", {"q": raw})
-        if data:
-            q_up = raw.upper()
-            cands = [(s.get("symbol") or "").upper() for s in data.get("symbols", []) or [] if looks_crypto(s)]
-            if not cands:
-                return None
-            # Priority: exact match with .X, then exact, then contains, else first
-            if f"{q_up}.X" in cands: return f"{q_up}.X"
-            if q_up in cands: return q_up
-            for c in cands:
-                if q_up in c: return c
-            return cands[0]
-        return None
-
-    def fetch_messages(self, slug: str, limit: int = 30) -> List[str]:
-        from urllib.parse import quote
-        data = self._get(f"streams/symbol/{quote(slug)}.json")
-        msgs: List[str] = []
-        if not data: return msgs
-        for m in data.get("messages", [])[:limit]:
-            body = (m.get("body") or "").strip()
-            if body: msgs.append(body)
-        time.sleep(BASE_SLEEP_SEC)
-        return msgs
-
-# --------------------------
-# TA (pure pandas)
-# --------------------------
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-def sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(window=length, min_periods=length).mean()
-def rsi_wilder(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def compute_indicators(df: pd.DataFrame) -> dict:
-    out = {"rsi14": None, "ema20": None, "sma50": None, "momentum_up": None}
-    if df is None or df.empty: return out
-    close = df["close"].astype(float)
-    rsi14 = rsi_wilder(close, 14).dropna()
-    ema20 = ema(close, 20).dropna()
-    sma50 = sma(close, 50).dropna()
-    out["rsi14"] = round(float(rsi14.iloc[-1]), 2) if not rsi14.empty else None
-    out["ema20"] = round(float(ema20.iloc[-1]), 6) if not ema20.empty else None
-    out["sma50"] = round(float(sma50.iloc[-1]), 6) if not sma50.empty else None
-    out["momentum_up"] = bool(close.iloc[-1] > close.iloc[-21]) if len(close) >= 21 else None
+def current_prices(kraken: KrakenClient, base_to_pair: Dict[str, str]) -> Dict[str, float]:
+    if not base_to_pair:
+        return {}
+    pairs = list(base_to_pair.values())
+    # Ticker allows batching many pairs
+    result = {}
+    # Kraken supports comma-separated list; batch to stay safe
+    BATCH = 20
+    for i in range(0, len(pairs), BATCH):
+        batch = pairs[i:i+BATCH]
+        t = kraken.ticker(batch)
+        for pair_alt, data in t.items():
+            # 'c' last trade [price, lot]
+            price = to_float(data.get("c", [None])[0])
+            if price is not None:
+                result[pair_alt] = price
+    # Map back to base symbol
+    out = {}
+    for base, pair in base_to_pair.items():
+        if pair in result:
+            out[base] = result[pair]
     return out
 
-# --------------------------
-# Helpers
-# --------------------------
-def slug_to_base(slug: str) -> str:
-    base = slug[:-2] if slug.endswith(".X") else slug
-    return {"XBT":"BTC","XDG":"DOGE"}.get(base.upper(), base.upper())
+# ---------- Cost basis from TradesHistory (spot USD) ----------
+def compute_avg_cost_for_position(base: str, qty: float, trades: dict, base_to_pair: Dict[str, str]) -> Optional[float]:
+    """
+    Compute the weighted average cost of the CURRENT held quantity (qty) using FIFO against spot USD trades.
+    Returns None if no trade data found.
+    """
+    pair = base_to_pair.get(base)
+    if not pair:
+        return None
 
-# --------------------------
-# Main
-# --------------------------
-def main():
-    sheets = SheetClient(DEFAULT_SHEET)
-    stw = StocktwitsClient()
-    kraken = KrakenClient()
-    vader = SentimentIntensityAnalyzer()
+    # Extract relevant trades in this pair
+    rows = []
+    for txid, tr in trades.items():
+        if tr.get("pair") != pair:
+            continue
+        ttype = tr.get("type")           # buy/sell
+        vol = to_float(tr.get("vol"))
+        price = to_float(tr.get("price"))
+        cost = to_float(tr.get("cost"))  # total cost (price*vol)
+        fee  = to_float(tr.get("fee") or 0.0)
+        time_ = float(tr.get("time", 0.0))
+        if not vol or not price:
+            continue
+        rows.append((time_, ttype, vol, price, cost, fee))
+    if not rows:
+        return None
 
-    # 1) Discover Stocktwits crypto slugs
-    log("Discovering crypto symbols from Stocktwits (trending + throttled search)…")
-    slugs = stw.discover_crypto_symbols(cap=MAX_STW_SYMBOLS)
-    if not slugs:
-        log("No Stocktwits crypto symbols discovered. Exiting.")
+    # Sort by time ascending (FIFO)
+    rows.sort(key=lambda r: r[0])
+
+    # Build inventory: add buys, remove sells
+    # After processing all, take the lots that make up the final qty and compute cost basis.
+    lots: List[Tuple[float, float]] = []  # list of (vol, unit_cost)
+    for _, ttype, vol, price, cost, fee in rows:
+        unit_cost = (cost + fee) / vol if vol else price
+        if ttype == "buy":
+            lots.append((vol, unit_cost))
+        elif ttype == "sell":
+            # remove from lots FIFO
+            remaining = vol
+            new_lots = []
+            for lvol, lcost in lots:
+                if remaining <= 0:
+                    new_lots.append((lvol, lcost))
+                    continue
+                take = min(lvol, remaining)
+                lvol_after = lvol - take
+                remaining -= take
+                if lvol_after > 0:
+                    new_lots.append((lvol_after, lcost))
+            lots = new_lots
+
+    # Now lots should represent current inventory (may be >, =, or < actual due to non-USD trades/withdrawals)
+    if qty <= 0:
+        return None
+
+    # Take the last 'qty' from FIFO lots
+    remaining = qty
+    total_cost = 0.0
+    total_vol = 0.0
+    for lvol, lcost in lots:
+        if remaining <= 0:
+            break
+        take = min(lvol, remaining)
+        total_cost += take * lcost
+        total_vol += take
+        remaining -= take
+
+    if total_vol <= 0:
+        return None
+    return total_cost / total_vol
+
+# ---------- Core loop ----------
+def run_once(kraken: KrakenClient, sheets: SheetClient):
+    # 1) Fetch balances (spot)
+    bal = kraken.balance()  # dict like {"XXBT": "0.5", "ZUSD": "123.45", ...}
+    # Filter only crypto bases (exclude fiat balances like ZUSD)
+    crypto_bal: Dict[str, float] = {}
+    for asset_code, amount in bal.items():
+        qty = to_float(amount)
+        if not qty or qty <= 0:
+            continue
+        # asset_code examples: XXBT, XETH, ZUSD. We want base alt like XBT → BTC
+        code = asset_code.replace("X", "").replace("Z", "")  # crude but usually OK (XXBT->XBT, ZUSD->USD)
+        if code == QUOTE_CCY:
+            continue
+        common = KRKN_BASE_TO_COMMON.get(code, code)  # XBT->BTC
+        crypto_bal[common] = crypto_bal.get(common, 0.0) + qty
+
+    if not crypto_bal:
+        logging.info("No crypto balances.")
+        # Still write a header so sheet is clean
+        header = [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]]
+        sheets.write_tab(SHEET_KRAKEN_TAB, header)
         return
 
-    # Optional hard-cap for processing volume
-    if MAX_TICKERS and len(slugs) > MAX_TICKERS:
-        slugs = slugs[:MAX_TICKERS]
+    # 2) Build pair maps & prices
+    pairs = kraken.get_asset_pairs()
+    base_to_pair, pair_to_base = build_pair_maps(pairs, QUOTE_CCY)
+    prices = current_prices(kraken, base_to_pair)
 
-    log(f"Discovered {len(slugs)} slugs. Example: {slugs[:12]}")
+    # 3) Trades history (for cost basis)
+    trades = kraken.trades_history()
 
-    # Write discovery inventory to Crypto-Scrape
-    sheets.clear_and_write(TICKERS_TAB, [["stw_symbol"]] + [[s] for s in sorted(slugs)])
-    log(f"Wrote {len(slugs)} Stocktwits crypto symbols to '{TICKERS_TAB}'.")
+    # 4) Load previous sheet state (for Armed & High P/L)
+    df_prev = sheets.read_tab(SHEET_KRAKEN_TAB)
+    prev_state = {}
+    if not df_prev.empty and "Symbol" in df_prev.columns:
+        for _, r in df_prev.iterrows():
+            sym = (r.get("Symbol") or "").upper()
+            armed = str(r.get("Armed") or "").strip().upper() in ("TRUE","1","YES","Y")
+            highpl = to_float(r.get("High P/L %"))
+            prev_state[sym] = {"armed": armed, "highpl": highpl}
 
-    # 2) For each slug: messages -> sentiment -> Kraken -> TA
-    results: List[List] = [[
-        "symbol", "messages", "avg_compound", "avg_pos", "avg_neg", "avg_neu",
-        "rsi14", "ema20", "sma50", "momentum_up"
-    ]]
+    # 5) Build rows & decide actions
+    rows = [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]]
+    for base, qty in sorted(crypto_bal.items()):
+        note = ""
+        armed_prev = prev_state.get(base, {}).get("armed", False)
+        high_prev = prev_state.get(base, {}).get("highpl", None)
 
-    for slug in slugs:
-        # Messages
-        messages = stw.fetch_messages(slug, limit=MESSAGES_PER_SYMBOL)
-        if not messages:
-            logging.info("[%s] No Stocktwits messages -> skip", slug)
+        pair = base_to_pair.get(base)
+        last_price = prices.get(base)
+        if not pair or last_price is None:
+            rows.append([base, "", qty, "", "", str(armed_prev), high_prev if high_prev is not None else "", "HOLD", now_iso(), "No price/pair"])
             continue
 
-        # Sentiment
-        comps=poss=negs=neus=0.0
-        for t in messages:
-            s = vader.polarity_scores(t)
-            comps += s["compound"]; poss += s["pos"]; negs += s["neg"]; neus += s["neu"]
-        n = float(len(messages))
-        agg = {
-            "count": int(n),
-            "compound": round(comps/n, 4),
-            "pos": round(poss/n, 4),
-            "neg": round(negs/n, 4),
-            "neu": round(neus/n, 4),
-        }
-
-        # Kraken OHLC (map slug -> base)
-        base = slug_to_base(slug)
-        if base in FIAT:
-            logging.info("[%s] Looks fiat -> skip", slug)
+        avg_cost = compute_avg_cost_for_position(base, qty, trades, base_to_pair)
+        if avg_cost is None or avg_cost <= 0:
+            # Fall back: unknown basis (treat P/L as 0 for display, do nothing)
+            rows.append([base, "", qty, "", last_price, str(armed_prev), high_prev if high_prev is not None else "", "HOLD", now_iso(), "No cost basis"])
             continue
 
-        ohlc = kraken.get_ohlc_for_symbol(base, quote=BASE_PAIR, interval=60)
-        if ohlc is None or ohlc.empty:
-            logging.info("[%s] No Kraken OHLC -> skip", slug)
-            continue
+        pl_pct = ((last_price - avg_cost) / avg_cost) * 100.0
 
-        ind = compute_indicators(ohlc)
-        results.append([
-            base, agg["count"], agg["compound"], agg["pos"], agg["neg"], agg["neu"],
-            ind["rsi14"], ind["ema20"], ind["sma50"], ind["momentum_up"]
+        # Determine next state/action
+        armed = armed_prev
+        high_pl = high_prev if high_prev is not None else (pl_pct if pl_pct >= ARM_THRESHOLD else None)
+        status = "HOLD"
+
+        # Stop loss first
+        action = None
+        if pl_pct <= LOSS_THRESHOLD:
+            status = "STOP_LOSS"
+            action = "SELL_ALL"
+
+        # Arm if threshold crossed
+        if action is None and (not armed) and pl_pct >= ARM_THRESHOLD:
+            armed = True
+            high_pl = pl_pct
+            status = "ARMED"
+            note = f"Armed at {pl_pct:.2f}%"
+
+        # Update high water while armed
+        if action is None and armed:
+            if high_pl is None or pl_pct > high_pl:
+                high_pl = pl_pct
+            # Trailing giveback
+            if high_pl is not None and pl_pct <= (high_pl - TRAIL_GIVEBACK):
+                status = "TAKE_PROFIT"
+                action = "SELL_ALL"
+
+        # Execute action (sell 100%) if needed
+        if action == "SELL_ALL":
+            vol_to_sell = qty
+            if LIVE_TRADING:
+                try:
+                    res = kraken.add_order_market_sell(pair, vol_to_sell)
+                    note = f"Sold {vol_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
+                    # After selling, reset armed/high
+                    armed = False
+                    high_pl = None
+                    status = "SOLD"
+                except Exception as e:
+                    note = f"SELL FAILED: {e}"
+                    status = "ERROR"
+            else:
+                # Paper trade
+                note = f"(PAPER) Would SELL {vol_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
+                armed = False
+                high_pl = None
+                status = "SOLD"
+
+        # Append row
+        rows.append([
+            base,
+            f"{pl_pct:.2f}",
+            f"{qty:.10g}",
+            f"{avg_cost:.8f}",
+            f"{last_price:.8f}",
+            "TRUE" if armed else "FALSE",
+            f"{high_pl:.2f}" if high_pl is not None else "",
+            status,
+            now_iso(),
+            note
         ])
 
-    # 3) Write only successful rows
-    sheets.clear_and_write(SENTIMENT_TAB, results)
-    log(f"Wrote {len(results)-1} rows to '{SENTIMENT_TAB}'. Done.")
+    # 6) Write to sheet
+    sheets.write_tab(SHEET_KRAKEN_TAB, rows)
+    logging.info("Sheet updated.")
+
+def main():
+    # Clients
+    sheets = SheetClient(GOOGLE_SHEET_NAME)
+    kraken = KrakenClient(KRAKEN_KEY, KRAKEN_SECRET)
+
+    logging.info("Starting Kraken tracker & seller (LIVE_TRADING=%s)", LIVE_TRADING)
+    while True:
+        try:
+            run_once(kraken, sheets)
+        except Exception as e:
+            logging.error("Run error: %s", e)
+        time.sleep(INTERVAL_SEC)
 
 if __name__ == "__main__":
     main()
