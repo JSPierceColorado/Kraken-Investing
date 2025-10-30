@@ -8,13 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-# Upgrade pip for latest wheels/resolver, then install deps
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
-
-# Pre-download VADER lexicon
-RUN python -m nltk.downloader vader_lexicon
 
 CMD ["python", "main.py"]
