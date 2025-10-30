@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps (build tools are small but help with some wheels)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
  && rm -rf /var/lib/apt/lists/*
@@ -10,10 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
 COPY main.py ./
 
-# (Optional) Pre-download the VADER lexicon to avoid first-run download
-RUN python - <<'PY'\nimport nltk\nnltk.download('vader_lexicon')\nPY
+# Pre-download VADER lexicon (safer syntax for Railway builds)
+RUN python -m nltk.downloader vader_lexicon
 
 CMD ["python", "main.py"]
