@@ -1,24 +1,39 @@
 """
-Pipeline:
-  Stocktwits universe (search) -> messages -> VADER sentiment
-  -> Kraken OHLC -> TA (RSI14, EMA20, SMA50, momentum_up)
-  -> Write only fully-successful rows to Crypto-Sentiment
+STOCKTWITS-FIRST PIPELINE (resilient discovery, no preloaded tickers)
 
-Env:
-  GOOGLE_CREDS_JSON  (service account JSON)
-  GOOGLE_SHEET_NAME  (default Active-Investing)
-  SHEET_TICKERS_TAB  (default Crypto-Scrape)       # will list discovered Stocktwits crypto symbols (slugs)
-  SHEET_SENTIMENT_TAB(default Crypto-Sentiment)
-  KRAKEN_BASE_PAIR   (default USD)
-  HTTP_TIMEOUT       (default 20)
-  MAX_STW_SYMBOLS    (optional cap for discovered STW symbols, default 500)
-  MESSAGES_PER_SYMBOL(default 30)
-  RATE_SLEEP_SEC     (default 0.35)
+Flow
+----
+1) Discover crypto symbols from Stocktwits:
+   - Seed with /trending/symbols.json
+   - Expand via throttled /search/symbols.json sweeps over A..Z and 0..9
+   - Keep only crypto-like results (type contains 'crypto' or symbol ends with '.X')
+2) Write discovery inventory to Google Sheet: Active-Investing → Crypto-Scrape
+3) For each discovered symbol (slug):
+   - Fetch messages from Stocktwits (search-first to confirm slug → stream)
+   - If messages > 0, compute VADER averages
+   - Map slug to Kraken base (strip '.X'; XBT/DOGE normalization) and fetch OHLC(60m)
+   - Compute RSI(14), EMA(20), SMA(50), simple momentum
+   - If any step fails → EXCLUDE the symbol
+4) Write only fully successful rows to Active-Investing → Crypto-Sentiment
+
+Env
+---
+GOOGLE_CREDS_JSON
+GOOGLE_SHEET_NAME   (default "Active-Investing")
+SHEET_TICKERS_TAB   (default "Crypto-Scrape")
+SHEET_SENTIMENT_TAB (default "Crypto-Sentiment")
+KRAKEN_BASE_PAIR    (default "USD")
+HTTP_TIMEOUT        (default 20)
+MAX_STW_SYMBOLS     (default 600)   # cap for discovery list to avoid rate limits
+MESSAGES_PER_SYMBOL (default 30)
+BASE_SLEEP_SEC      (default 0.35)  # base pacing between calls
+MAX_RETRIES         (default 3)     # retries for 429/5xx
+MAX_TICKERS         (optional, if you want to hard-cap post-discovery processing)
 """
 
 from __future__ import annotations
 
-import os, json, re, time, logging
+import os, json, re, time, math, logging
 from typing import Dict, List, Optional, Set
 
 import requests
@@ -44,9 +59,11 @@ TICKERS_TAB = os.getenv("SHEET_TICKERS_TAB", "Crypto-Scrape")
 SENTIMENT_TAB = os.getenv("SHEET_SENTIMENT_TAB", "Crypto-Sentiment")
 BASE_PAIR = os.getenv("KRAKEN_BASE_PAIR", "USD").upper()
 
-MAX_STW_SYMBOLS = int(os.getenv("MAX_STW_SYMBOLS", "500"))
+MAX_STW_SYMBOLS = int(os.getenv("MAX_STW_SYMBOLS", "600"))
 MESSAGES_PER_SYMBOL = int(os.getenv("MESSAGES_PER_SYMBOL", "30"))
-RATE_SLEEP_SEC = float(os.getenv("RATE_SLEEP_SEC", "0.35"))
+BASE_SLEEP_SEC = float(os.getenv("BASE_SLEEP_SEC", "0.35"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "0"))  # 0 = no cap
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 def log(msg: str): print(msg, flush=True)
@@ -69,10 +86,10 @@ class SheetClient:
         try:
             ws = self.sheet.worksheet(tab)
         except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="26")
+            ws = self.sheet.add_worksheet(title=tab, rows="5000", cols="26")
         ws.clear()
         if rows:
-            ws.update(rows, "A1", value_input_option="RAW")  # values first (fix deprecation)
+            ws.update(rows, "A1", value_input_option="RAW")  # values first (no deprecation)
 
 # --------------------------
 # Kraken API
@@ -88,7 +105,7 @@ class KrakenClient:
         return data["result"]
 
     def get_ohlc_for_symbol(self, base_symbol: str, quote: str = "USD", interval: int = 60) -> Optional[pd.DataFrame]:
-        # Kraken uses e.g. XBT for BTC, XDG for DOGE
+        # Map common aliases
         kraken_base = {"BTC":"XBT","DOGE":"XDG"}.get(base_symbol.upper(), base_symbol.upper())
         pair = f"{kraken_base}{quote.upper()}"
         try:
@@ -109,10 +126,19 @@ class KrakenClient:
             return None
 
 # --------------------------
-# Stocktwits client
+# Stocktwits (resilient discovery + fetch)
 # --------------------------
 SYMBOL_RE = re.compile(r"(?=.*[A-Z])[A-Z0-9]{2,10}$")
 FIAT = {"USD","EUR","AUD","GBP","JPY","CAD","CHF","CNY","CNH","NZD","SEK","NOK","DKK","HKD","SGD","ZAR","MXN"}
+
+def looks_crypto(sym_obj: dict) -> bool:
+    sym = (sym_obj.get("symbol") or "").upper()
+    typ = (sym_obj.get("type") or "").lower()
+    if sym.endswith(".X"):             # common Stocktwits crypto suffix
+        return True
+    if "crypto" in typ:                # e.g., "cryptocurrency"
+        return True
+    return False
 
 class StocktwitsClient:
     BASE = "https://api.stocktwits.com/api/2"
@@ -123,53 +149,106 @@ class StocktwitsClient:
             "Accept": "application/json",
         })
 
-    def _get(self, path: str, params: Optional[dict]=None) -> Optional[dict]:
-        try:
-            r = self.s.get(f"{self.BASE}/{path}", params=params or {}, timeout=HTTP_TIMEOUT)
-            if r.status_code != 200:
-                logging.info("Stocktwits GET %s -> %s", path, r.status_code)
+    def _get(self, path: str, params: Optional[dict]=None, *, allow_retry: bool=True) -> Optional[dict]:
+        """GET with retry/backoff on 429/5xx."""
+        url = f"{self.BASE}/{path}"
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                r = self.s.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
+                code = r.status_code
+                if code == 200:
+                    return r.json()
+                # retry on 429 and 5xx
+                if allow_retry and (code == 429 or 500 <= code < 600):
+                    sleep_s = BASE_SLEEP_SEC * (2 ** (attempt - 1))
+                    logging.info("Stocktwits %s -> %s; retrying in %.2fs (attempt %d/%d)",
+                                 path, code, sleep_s, attempt, MAX_RETRIES)
+                    time.sleep(sleep_s)
+                    continue
+                logging.info("Stocktwits %s -> HTTP %s (no retry)", path, code)
                 return None
-            return r.json()
-        except Exception as e:
-            logging.info("Stocktwits GET error %s: %s", path, e)
-            return None
+            except Exception as e:
+                if allow_retry and attempt < MAX_RETRIES:
+                    sleep_s = BASE_SLEEP_SEC * (2 ** (attempt - 1))
+                    logging.info("Stocktwits %s error %s; retrying in %.2fs (attempt %d/%d)",
+                                 path, e, sleep_s, attempt, MAX_RETRIES)
+                    time.sleep(sleep_s)
+                    continue
+                logging.info("Stocktwits %s error (final): %s", path, e)
+                return None
+        return None
 
-    def discover_crypto_symbols(self, cap: int = 500) -> List[str]:
-        """
-        Heuristic discovery: sweep search queries to collect crypto symbols.
-        No hardcoded tickers; uses alphanumeric sweeps.
-        """
-        queries = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        seen: Set[str] = set()
+    def trending_symbols(self) -> List[str]:
+        data = self._get("trending/symbols.json")
         out: List[str] = []
-        for q in queries:
-            data = self._get("search/symbols.json", {"q": q})
-            time.sleep(RATE_SLEEP_SEC)
-            if not data: continue
-            for s in data.get("symbols", []) or []:
+        if not data: return out
+        for s in data.get("symbols", []) or []:
+            if looks_crypto(s):
                 sym = (s.get("symbol") or "").upper()
-                # Prefer only crypto-like results; Stocktwits 'type' varies (e.g., "cryptocurrency", "crypto")
-                typ = (s.get("type") or "").lower()
-                if typ and "crypto" not in typ:
-                    continue
-                if not SYMBOL_RE.fullmatch(sym):  # basic hygiene
-                    continue
-                if sym in FIAT:  # skip fiat codes
-                    continue
-                if sym not in seen:
-                    seen.add(sym)
+                if SYMBOL_RE.fullmatch(sym) and sym not in FIAT:
                     out.append(sym)
-                    if len(out) >= cap:
-                        return out
+        time.sleep(BASE_SLEEP_SEC)
         return out
 
+    def search_symbols(self, q: str) -> List[str]:
+        data = self._get("search/symbols.json", {"q": q})
+        out: List[str] = []
+        if not data: return out
+        for s in data.get("symbols", []) or []:
+            if looks_crypto(s):
+                sym = (s.get("symbol") or "").upper()
+                if SYMBOL_RE.fullmatch(sym) and sym not in FIAT:
+                    out.append(sym)
+        time.sleep(BASE_SLEEP_SEC)
+        return out
+
+    def discover_crypto_symbols(self, cap: int = 600) -> List[str]:
+        """Trending seed + throttled alphanumeric search sweep until cap."""
+        seen: Set[str] = set()
+        out: List[str] = []
+
+        # 1) seed with trending
+        for sym in self.trending_symbols():
+            if sym not in seen:
+                seen.add(sym); out.append(sym)
+                if len(out) >= cap: return out
+
+        # 2) search sweep A..Z and 0..9 (throttled)
+        queries = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        for q in queries:
+            for sym in self.search_symbols(q):
+                if sym not in seen:
+                    seen.add(sym); out.append(sym)
+                    if len(out) >= cap: return out
+        return out
+
+    # per-symbol: confirm slug via search, then pull stream
+    def find_slug_for_symbol(self, raw: str) -> Optional[str]:
+        # Many crypto slugs on STW end with ".X"
+        # Search raw, then try raw+".X" if exact isn't returned by search
+        data = self._get("search/symbols.json", {"q": raw})
+        if data:
+            q_up = raw.upper()
+            cands = [(s.get("symbol") or "").upper() for s in data.get("symbols", []) or [] if looks_crypto(s)]
+            if not cands:
+                return None
+            # Priority: exact match with .X, then exact, then contains, else first
+            if f"{q_up}.X" in cands: return f"{q_up}.X"
+            if q_up in cands: return q_up
+            for c in cands:
+                if q_up in c: return c
+            return cands[0]
+        return None
+
     def fetch_messages(self, slug: str, limit: int = 30) -> List[str]:
-        data = self._get(f"streams/symbol/{slug}.json")
-        if not data: return []
-        msgs = []
+        from urllib.parse import quote
+        data = self._get(f"streams/symbol/{quote(slug)}.json")
+        msgs: List[str] = []
+        if not data: return msgs
         for m in data.get("messages", [])[:limit]:
-            t = (m.get("body") or "").strip()
-            if t: msgs.append(t)
+            body = (m.get("body") or "").strip()
+            if body: msgs.append(body)
+        time.sleep(BASE_SLEEP_SEC)
         return msgs
 
 # --------------------------
@@ -202,6 +281,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     return out
 
 # --------------------------
+# Helpers
+# --------------------------
+def slug_to_base(slug: str) -> str:
+    base = slug[:-2] if slug.endswith(".X") else slug
+    return {"XBT":"BTC","XDG":"DOGE"}.get(base.upper(), base.upper())
+
+# --------------------------
 # Main
 # --------------------------
 def main():
@@ -210,38 +296,42 @@ def main():
     kraken = KrakenClient()
     vader = SentimentIntensityAnalyzer()
 
-    # 1) Discover Stocktwits crypto symbols (slugs)
-    log("Discovering crypto symbols from Stocktwits…")
-    stw_syms = stw.discover_crypto_symbols(cap=MAX_STW_SYMBOLS)
-    if not stw_syms:
+    # 1) Discover Stocktwits crypto slugs
+    log("Discovering crypto symbols from Stocktwits (trending + throttled search)…")
+    slugs = stw.discover_crypto_symbols(cap=MAX_STW_SYMBOLS)
+    if not slugs:
         log("No Stocktwits crypto symbols discovered. Exiting.")
         return
-    log(f"Discovered {len(stw_syms)} symbols. Example: {stw_syms[:12]}")
+
+    # Optional hard-cap for processing volume
+    if MAX_TICKERS and len(slugs) > MAX_TICKERS:
+        slugs = slugs[:MAX_TICKERS]
+
+    log(f"Discovered {len(slugs)} slugs. Example: {slugs[:12]}")
 
     # Write discovery inventory to Crypto-Scrape
-    sheets.clear_and_write(TICKERS_TAB, [["stw_symbol"]] + [[s] for s in sorted(stw_syms)])
-    log(f"Wrote {len(stw_syms)} Stocktwits crypto symbols to '{TICKERS_TAB}'.")
+    sheets.clear_and_write(TICKERS_TAB, [["stw_symbol"]] + [[s] for s in sorted(slugs)])
+    log(f"Wrote {len(slugs)} Stocktwits crypto symbols to '{TICKERS_TAB}'.")
 
-    # 2) For each symbol: fetch messages & sentiment
+    # 2) For each slug: messages -> sentiment -> Kraken -> TA
     results: List[List] = [[
         "symbol", "messages", "avg_compound", "avg_pos", "avg_neg", "avg_neu",
         "rsi14", "ema20", "sma50", "momentum_up"
     ]]
 
-    for slug in stw_syms:
-        # messages
-        msgs = stw.fetch_messages(slug, limit=MESSAGES_PER_SYMBOL)
-        time.sleep(RATE_SLEEP_SEC)
-        if not msgs:
+    for slug in slugs:
+        # Messages
+        messages = stw.fetch_messages(slug, limit=MESSAGES_PER_SYMBOL)
+        if not messages:
             logging.info("[%s] No Stocktwits messages -> skip", slug)
             continue
 
-        # sentiment
+        # Sentiment
         comps=poss=negs=neus=0.0
-        for t in msgs:
+        for t in messages:
             s = vader.polarity_scores(t)
             comps += s["compound"]; poss += s["pos"]; negs += s["neg"]; neus += s["neu"]
-        n = float(len(msgs))
+        n = float(len(messages))
         agg = {
             "count": int(n),
             "compound": round(comps/n, 4),
@@ -250,14 +340,12 @@ def main():
             "neu": round(neus/n, 4),
         }
 
-        # Map to Kraken base symbol: strip trailing ".X" if present
-        base = slug[:-2] if slug.endswith(".X") else slug
-        # Skip obvious non-crypto fiat leftovers
-        if base.upper() in FIAT: 
+        # Kraken OHLC (map slug -> base)
+        base = slug_to_base(slug)
+        if base in FIAT:
             logging.info("[%s] Looks fiat -> skip", slug)
             continue
 
-        # 3) Kraken OHLC + TA
         ohlc = kraken.get_ohlc_for_symbol(base, quote=BASE_PAIR, interval=60)
         if ohlc is None or ohlc.empty:
             logging.info("[%s] No Kraken OHLC -> skip", slug)
@@ -269,7 +357,7 @@ def main():
             ind["rsi14"], ind["ema20"], ind["sma50"], ind["momentum_up"]
         ])
 
-    # 4) Write only fully successful rows
+    # 3) Write only successful rows
     sheets.clear_and_write(SENTIMENT_TAB, results)
     log(f"Wrote {len(results)-1} rows to '{SENTIMENT_TAB}'. Done.")
 
