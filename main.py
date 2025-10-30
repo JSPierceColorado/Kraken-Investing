@@ -1,38 +1,7 @@
 """
 Kraken Tracker & Seller (Perpetual loop, trailing take profit)
-
-Sheet (tab: Kraken Integration)
--------------------------------
-A: Symbol
-B: P/L %
-C: Quantity
-D: Avg Cost (quote)
-E: Last Price (quote)
-F: Armed (TRUE/FALSE)
-G: High P/L % (since armed)
-H: Status (e.g., HOLD / ARMED / SOLD / STOP_LOSS)
-I: Last Update (UTC ISO)
-J: Notes (last action / errors)
-
-Trading rules
--------------
-- Stop loss: if P/L% <= LOSS_THRESHOLD (default -3), SELL 100%
-- Trailing take profit:
-  - If P/L% >= ARM_THRESHOLD (default +5), set Armed=TRUE and High=P/L%
-  - While Armed, update High on new highs; if P/L% <= High - TRAIL_GIVEBACK (default 2), SELL 100%
-
-Env Vars
---------
-KRAKEN_API_KEY, KRAKEN_API_SECRET
-GOOGLE_CREDS_JSON
-GOOGLE_SHEET_NAME      (default: Active-Investing)
-SHEET_KRAKEN_TAB       (default: Kraken Integration)
-QUOTE_CCY              (default: USD)
-LOSS_THRESHOLD         (default: -3)      # percent
-ARM_THRESHOLD          (default: 5)       # percent
-TRAIL_GIVEBACK         (default: 2)       # percent
-INTERVAL_SEC           (default: 300)     # sleep between loops
-LIVE_TRADING           (default: false)   # true to place real orders
+- Removes SOLD rows from Kraken Integration immediately (logs to 'Kraken Trades')
+- Normalizes Kraken balance assets (e.g., ADA.F -> ADA) to compute P/L and place orders
 """
 
 from __future__ import annotations
@@ -40,9 +9,6 @@ from __future__ import annotations
 import os
 import json
 import time
-import hmac
-import hashlib
-import base64
 import logging
 from typing import Dict, List, Optional, Tuple
 
@@ -58,15 +24,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
 SHEET_KRAKEN_TAB = os.getenv("SHEET_KRAKEN_TAB", "Kraken Integration")
+SHEET_TRADES_TAB = os.getenv("SHEET_TRADES_TAB", "Kraken Trades")
 QUOTE_CCY = os.getenv("QUOTE_CCY", "USD").upper()
 
-LOSS_THRESHOLD = float(os.getenv("LOSS_THRESHOLD", "-3"))
-ARM_THRESHOLD = float(os.getenv("ARM_THRESHOLD", "5"))
-TRAIL_GIVEBACK = float(os.getenv("TRAIL_GIVEBACK", "2"))
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "300"))
-LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+LOSS_THRESHOLD = float(os.getenv("LOSS_THRESHOLD", "-3"))   # %
+ARM_THRESHOLD  = float(os.getenv("ARM_THRESHOLD", "5"))     # %
+TRAIL_GIVEBACK = float(os.getenv("TRAIL_GIVEBACK", "2"))    # %
+INTERVAL_SEC   = int(os.getenv("INTERVAL_SEC", "300"))
+LIVE_TRADING   = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
-KRAKEN_KEY = os.getenv("KRAKEN_API_KEY", "")
+KRAKEN_KEY    = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
 SCOPES = [
@@ -74,19 +41,37 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Map for Kraken base asset codes <-> common symbols
+# Kraken base-code mappings
 KRKN_BASE_TO_COMMON = {"XBT": "BTC", "XDG": "DOGE"}
 COMMON_TO_KRKN_BASE = {"BTC": "XBT", "DOGE": "XDG"}
+
+BALANCE_SUFFIXES = (".F", ".S", ".M", ".P")  # Funding/Staked/Margin/Pro
+FIAT_LIKE = {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "NZD"}
 
 # ---------- Helpers ----------
 def now_iso() -> str:
     return pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def to_float(x) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
+
+def normalize_balance_asset(asset_code: str) -> str:
+    """
+    Kraken balance assets look like: XXBT, XETH, ZUSD, ADA.F, SOL.F, etc.
+    - strip leading X/Z
+    - strip known suffixes (.F, .S, .M, .P)
+    - map XBT->BTC, XDG->DOGE
+    """
+    code = asset_code
+    if code.startswith(("X", "Z")) and len(code) >= 2:
+        code = code[1:]
+    for suf in BALANCE_SUFFIXES:
+        if code.endswith(suf):
+            code = code[: -len(suf)]
+            break
+    code = KRKN_BASE_TO_COMMON.get(code.upper(), code.upper())
+    return code
 
 # ---------- Google Sheets ----------
 class SheetClient:
@@ -99,170 +84,139 @@ class SheetClient:
         self.gc = gspread.authorize(creds)
         self.sheet = self.gc.open(sheet_name)
 
-    def read_tab(self, tab: str) -> pd.DataFrame:
+    def ensure_tab(self, tab: str, rows: int = 2000, cols: int = 20):
         try:
-            ws = self.sheet.worksheet(tab)
+            return self.sheet.worksheet(tab)
         except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="20")
+            return self.sheet.add_worksheet(title=tab, rows=str(rows), cols=str(cols))
+
+    def read_tab(self, tab: str) -> pd.DataFrame:
+        ws = self.ensure_tab(tab)
         data = ws.get_all_values()
-        if not data:
-            return pd.DataFrame()
+        if not data: return pd.DataFrame()
         header, *rows = data
-        if not header:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=header)
-        return df
+        if not header: return pd.DataFrame()
+        return pd.DataFrame(rows, columns=header)
 
     def write_tab(self, tab: str, rows: List[List]):
-        try:
-            ws = self.sheet.worksheet(tab)
-        except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="20")
+        ws = self.ensure_tab(tab)
         ws.clear()
         if rows:
             # values first, then range (deprecation-safe)
             ws.update(rows, "A1", value_input_option="RAW")
 
+    def append_rows(self, tab: str, rows: List[List]):
+        ws = self.ensure_tab(tab)
+        if rows:
+            ws.append_rows(rows, value_input_option="RAW")
+
 # ---------- Kraken ----------
 class KrakenClient:
-    PUBLIC = "https://api.kraken.com/0/public"
-    PRIVATE = "https://api.kraken.com/0/private"
+    PUBLIC  = "https://api.kraken.com/0/public"
 
     def __init__(self, key: str, secret: str):
         self.api = krakenex.API(key, secret)
         self.session = requests.Session()
 
-    # --------- Public ---------
+    # Public
     def get_asset_pairs(self) -> dict:
         r = self.session.get(f"{self.PUBLIC}/AssetPairs", timeout=20)
         r.raise_for_status()
         res = r.json()
-        if res.get("error"):
-            raise RuntimeError(res["error"])
+        if res.get("error"): raise RuntimeError(res["error"])
         return res["result"]
 
     def ticker(self, pairs: List[str]) -> dict:
-        # pairs must be comma-separated altnames like XBTUSD
         params = {"pair": ",".join(pairs)}
         r = self.session.get(f"{self.PUBLIC}/Ticker", params=params, timeout=20)
         r.raise_for_status()
         res = r.json()
-        if res.get("error"):
-            raise RuntimeError(res["error"])
+        if res.get("error"): raise RuntimeError(res["error"])
         return res["result"]
 
-    # --------- Private (via krakenex) ---------
+    # Private via krakenex
     def balance(self) -> dict:
         res = self.api.query_private("Balance")
-        if res.get("error"):
-            raise RuntimeError(res["error"])
+        if res.get("error"): raise RuntimeError(res["error"])
         return res["result"]
 
     def trades_history(self) -> dict:
-        # you can paginate if needed; this fetches recent history by default
         res = self.api.query_private("TradesHistory", {"trades": True})
-        if res.get("error"):
-            raise RuntimeError(res["error"])
+        if res.get("error"): raise RuntimeError(res["error"])
         return res["result"]["trades"]
 
     def add_order_market_sell(self, pair_altname: str, volume: float) -> dict:
-        payload = {
-            "pair": pair_altname,   # e.g., XBTUSD
-            "type": "sell",
-            "ordertype": "market",
-            "volume": str(volume)
-        }
+        payload = {"pair": pair_altname, "type": "sell", "ordertype": "market", "volume": str(volume)}
         res = self.api.query_private("AddOrder", payload)
-        if res.get("error"):
-            raise RuntimeError(res["error"])
+        if res.get("error"): raise RuntimeError(res["error"])
         return res["result"]
 
 # ---------- Pair mapping & pricing ----------
 def build_pair_maps(asset_pairs: dict, quote_ccy: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """
-    Returns:
-      base_to_altpair: map common base symbol (BTC) -> pair altname (XBTUSD)
-      altpair_to_base: reverse map altname -> common base symbol
-    Only pairs quoted in `quote_ccy` are considered.
-    """
     quote_ccy = quote_ccy.upper()
     base_to_altpair: Dict[str, str] = {}
     altpair_to_base: Dict[str, str] = {}
-    for key, info in asset_pairs.items():
-        altname = info.get("altname")      # e.g., XBTUSD
-        wsname = info.get("wsname")        # e.g., XBT/USD
+    for _, info in asset_pairs.items():
+        altname = info.get("altname")  # e.g., XBTUSD
+        wsname  = info.get("wsname")   # e.g., XBT/USD
         if not altname or not wsname or "/" not in wsname:
             continue
         base, quote = wsname.split("/")
         if quote.upper() != quote_ccy:
             continue
-        common = KRKN_BASE_TO_COMMON.get(base.upper(), base.upper())  # XBT->BTC, XDG->DOGE
+        common = KRKN_BASE_TO_COMMON.get(base.upper(), base.upper())
         base_to_altpair[common] = altname
         altpair_to_base[altname] = common
     return base_to_altpair, altpair_to_base
 
 def current_prices(kraken: KrakenClient, base_to_pair: Dict[str, str]) -> Dict[str, float]:
-    if not base_to_pair:
-        return {}
+    if not base_to_pair: return {}
     pairs = list(base_to_pair.values())
-    # Ticker allows batching many pairs
-    result = {}
-    # Kraken supports comma-separated list; batch to stay safe
+    out: Dict[str, float] = {}
     BATCH = 20
     for i in range(0, len(pairs), BATCH):
         batch = pairs[i:i+BATCH]
         t = kraken.ticker(batch)
         for pair_alt, data in t.items():
-            # 'c' last trade [price, lot]
             price = to_float(data.get("c", [None])[0])
             if price is not None:
-                result[pair_alt] = price
-    # Map back to base symbol
-    out = {}
-    for base, pair in base_to_pair.items():
-        if pair in result:
-            out[base] = result[pair]
+                base = next((b for b, p in base_to_pair.items() if p == pair_alt), None)
+                if base: out[base] = price
     return out
 
-# ---------- Cost basis from TradesHistory (spot USD) ----------
-def compute_avg_cost_for_position(base: str, qty: float, trades: dict, base_to_pair: Dict[str, str]) -> Optional[float]:
-    """
-    Compute the weighted average cost of the CURRENT held quantity (qty) using FIFO against spot USD trades.
-    Returns None if no trade data found.
-    """
+# ---------- Cost basis ----------
+def compute_avg_cost_fifo(base: str, qty: float, trades: dict, base_to_pair: Dict[str, str]) -> Optional[float]:
+    """FIFO avg cost for current qty based on USD spot trades for the given base."""
     pair = base_to_pair.get(base)
-    if not pair:
+    if not pair or qty <= 0:
         return None
 
-    # Extract relevant trades in this pair
     rows = []
-    for txid, tr in trades.items():
+    for _, tr in trades.items():
         if tr.get("pair") != pair:
             continue
-        ttype = tr.get("type")           # buy/sell
-        vol = to_float(tr.get("vol"))
-        price = to_float(tr.get("price"))
-        cost = to_float(tr.get("cost"))  # total cost (price*vol)
-        fee  = to_float(tr.get("fee") or 0.0)
+        ttype = tr.get("type")              # 'buy' | 'sell'
+        vol   = to_float(tr.get("vol"))
+        cost  = to_float(tr.get("cost"))    # total cost in quote
+        fee   = to_float(tr.get("fee") or 0.0)
         time_ = float(tr.get("time", 0.0))
-        if not vol or not price:
+        if not vol or cost is None:
             continue
-        rows.append((time_, ttype, vol, price, cost, fee))
+        unit_cost = (cost + fee) / vol if vol else None
+        if unit_cost is None:
+            continue
+        rows.append((time_, ttype, vol, unit_cost))
+
     if not rows:
         return None
 
-    # Sort by time ascending (FIFO)
     rows.sort(key=lambda r: r[0])
 
-    # Build inventory: add buys, remove sells
-    # After processing all, take the lots that make up the final qty and compute cost basis.
-    lots: List[Tuple[float, float]] = []  # list of (vol, unit_cost)
-    for _, ttype, vol, price, cost, fee in rows:
-        unit_cost = (cost + fee) / vol if vol else price
+    lots: List[Tuple[float, float]] = []  # (vol, unit_cost)
+    for _, ttype, vol, ucost in rows:
         if ttype == "buy":
-            lots.append((vol, unit_cost))
+            lots.append((vol, ucost))
         elif ttype == "sell":
-            # remove from lots FIFO
             remaining = vol
             new_lots = []
             for lvol, lcost in lots:
@@ -276,21 +230,16 @@ def compute_avg_cost_for_position(base: str, qty: float, trades: dict, base_to_p
                     new_lots.append((lvol_after, lcost))
             lots = new_lots
 
-    # Now lots should represent current inventory (may be >, =, or < actual due to non-USD trades/withdrawals)
-    if qty <= 0:
-        return None
-
-    # Take the last 'qty' from FIFO lots
     remaining = qty
     total_cost = 0.0
-    total_vol = 0.0
+    total_vol  = 0.0
     for lvol, lcost in lots:
         if remaining <= 0:
             break
         take = min(lvol, remaining)
         total_cost += take * lcost
-        total_vol += take
-        remaining -= take
+        total_vol  += take
+        remaining  -= take
 
     if total_vol <= 0:
         return None
@@ -298,37 +247,41 @@ def compute_avg_cost_for_position(base: str, qty: float, trades: dict, base_to_p
 
 # ---------- Core loop ----------
 def run_once(kraken: KrakenClient, sheets: SheetClient):
-    # 1) Fetch balances (spot)
-    bal = kraken.balance()  # dict like {"XXBT": "0.5", "ZUSD": "123.45", ...}
-    # Filter only crypto bases (exclude fiat balances like ZUSD)
+    # 1) Balances (normalize, aggregate)
+    bal = kraken.balance()
     crypto_bal: Dict[str, float] = {}
+    raw_to_norm: Dict[str, str] = {}
+
     for asset_code, amount in bal.items():
         qty = to_float(amount)
         if not qty or qty <= 0:
             continue
-        # asset_code examples: XXBT, XETH, ZUSD. We want base alt like XBT → BTC
-        code = asset_code.replace("X", "").replace("Z", "")  # crude but usually OK (XXBT->XBT, ZUSD->USD)
-        if code == QUOTE_CCY:
+        norm = normalize_balance_asset(asset_code)  # e.g., ADA.F -> ADA
+        raw_to_norm[asset_code] = norm
+        if norm in FIAT_LIKE:  # skip fiat balances
             continue
-        common = KRKN_BASE_TO_COMMON.get(code, code)  # XBT->BTC
-        crypto_bal[common] = crypto_bal.get(common, 0.0) + qty
+        crypto_bal[norm] = crypto_bal.get(norm, 0.0) + qty
 
     if not crypto_bal:
         logging.info("No crypto balances.")
-        # Still write a header so sheet is clean
-        header = [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]]
-        sheets.write_tab(SHEET_KRAKEN_TAB, header)
+        sheets.write_tab(SHEET_KRAKEN_TAB, [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]])
         return
 
-    # 2) Build pair maps & prices
+    # 2) Pair maps & prices (only keep bases with a USD pair)
     pairs = kraken.get_asset_pairs()
-    base_to_pair, pair_to_base = build_pair_maps(pairs, QUOTE_CCY)
-    prices = current_prices(kraken, base_to_pair)
+    base_to_pair, _ = build_pair_maps(pairs, QUOTE_CCY)
 
-    # 3) Trades history (for cost basis)
+    # Filter out anything without tradable USD pair (e.g., LC, STBL, some earn tokens)
+    crypto_bal = {b:q for b,q in crypto_bal.items() if b in base_to_pair}
+    if not crypto_bal:
+        logging.info("No tradable USD pairs found for balances.")
+        sheets.write_tab(SHEET_KRAKEN_TAB, [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]])
+        return
+
+    prices = current_prices(kraken, base_to_pair)
     trades = kraken.trades_history()
 
-    # 4) Load previous sheet state (for Armed & High P/L)
+    # 3) Previous sheet state (armed/high)
     df_prev = sheets.read_tab(SHEET_KRAKEN_TAB)
     prev_state = {}
     if not df_prev.empty and "Symbol" in df_prev.columns:
@@ -338,77 +291,88 @@ def run_once(kraken: KrakenClient, sheets: SheetClient):
             highpl = to_float(r.get("High P/L %"))
             prev_state[sym] = {"armed": armed, "highpl": highpl}
 
-    # 5) Build rows & decide actions
-    rows = [["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]]
+    # 4) Process positions; collect rows to KEEP; collect trade logs for SOLD
+    header = ["Symbol","P/L %","Quantity","Avg Cost","Last Price","Armed","High P/L %","Status","Last Update","Notes"]
+    keep_rows: List[List] = [header]
+    trade_logs: List[List] = []  # [time, action, symbol, qty, price, note]
+
     for base, qty in sorted(crypto_bal.items()):
         note = ""
         armed_prev = prev_state.get(base, {}).get("armed", False)
-        high_prev = prev_state.get(base, {}).get("highpl", None)
+        high_prev  = prev_state.get(base, {}).get("highpl", None)
 
-        pair = base_to_pair.get(base)
+        pair_alt = base_to_pair.get(base)
         last_price = prices.get(base)
-        if not pair or last_price is None:
-            rows.append([base, "", qty, "", "", str(armed_prev), high_prev if high_prev is not None else "", "HOLD", now_iso(), "No price/pair"])
+
+        # If we cannot price, skip (don't show a line that confuses P/L)
+        if not pair_alt or last_price is None or qty is None or qty <= 0:
+            logging.info("Skip %s: no price/pair/qty", base)
             continue
 
-        avg_cost = compute_avg_cost_for_position(base, qty, trades, base_to_pair)
+        avg_cost = compute_avg_cost_fifo(base, qty, trades, base_to_pair)
         if avg_cost is None or avg_cost <= 0:
-            # Fall back: unknown basis (treat P/L as 0 for display, do nothing)
-            rows.append([base, "", qty, "", last_price, str(armed_prev), high_prev if high_prev is not None else "", "HOLD", now_iso(), "No cost basis"])
+            logging.info("Skip %s: no cost basis from trade history", base)
             continue
 
         pl_pct = ((last_price - avg_cost) / avg_cost) * 100.0
 
-        # Determine next state/action
-        armed = armed_prev
+        # Determine action/state
+        armed   = armed_prev
         high_pl = high_prev if high_prev is not None else (pl_pct if pl_pct >= ARM_THRESHOLD else None)
-        status = "HOLD"
+        status  = "HOLD"
+        action  = None
+        qty_to_sell = 0.0
 
-        # Stop loss first
-        action = None
+        # Stop loss
         if pl_pct <= LOSS_THRESHOLD:
             status = "STOP_LOSS"
             action = "SELL_ALL"
+            qty_to_sell = qty
 
-        # Arm if threshold crossed
+        # Arming
         if action is None and (not armed) and pl_pct >= ARM_THRESHOLD:
             armed = True
             high_pl = pl_pct
             status = "ARMED"
             note = f"Armed at {pl_pct:.2f}%"
 
-        # Update high water while armed
+        # Update high & check trailing giveback
         if action is None and armed:
             if high_pl is None or pl_pct > high_pl:
                 high_pl = pl_pct
-            # Trailing giveback
             if high_pl is not None and pl_pct <= (high_pl - TRAIL_GIVEBACK):
                 status = "TAKE_PROFIT"
                 action = "SELL_ALL"
+                qty_to_sell = qty
 
-        # Execute action (sell 100%) if needed
+        # Execute sells; SOLD rows are NOT written to Integration sheet
         if action == "SELL_ALL":
-            vol_to_sell = qty
+            ts = now_iso()
             if LIVE_TRADING:
                 try:
-                    res = kraken.add_order_market_sell(pair, vol_to_sell)
-                    note = f"Sold {vol_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
-                    # After selling, reset armed/high
-                    armed = False
-                    high_pl = None
-                    status = "SOLD"
+                    res = kraken.add_order_market_sell(pair_alt, qty_to_sell)
+                    note = f"Sold {qty_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
+                    trade_logs.append([ts, "SELL", base, f"{qty_to_sell:.10g}", f"{last_price:.8f}", "LIVE", note])
                 except Exception as e:
-                    note = f"SELL FAILED: {e}"
-                    status = "ERROR"
+                    # If sale fails, keep the row so you can see it and try again next loop
+                    err = f"SELL FAILED: {e}"
+                    logging.error("%s %s", base, err)
+                    keep_rows.append([
+                        base, f"{pl_pct:.2f}", f"{qty:.10g}", f"{avg_cost:.8f}", f"{last_price:.8f}",
+                        "TRUE" if armed else "FALSE",
+                        f"{high_pl:.2f}" if high_pl is not None else "",
+                        "ERROR", ts, err
+                    ])
+                    continue
             else:
-                # Paper trade
-                note = f"(PAPER) Would SELL {vol_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
-                armed = False
-                high_pl = None
-                status = "SOLD"
+                note = f"(PAPER) Would SELL {qty_to_sell} {base} at ~{last_price} {QUOTE_CCY}"
+                trade_logs.append([ts, "SELL", base, f"{qty_to_sell:.10g}", f"{last_price:.8f}", "PAPER", note])
 
-        # Append row
-        rows.append([
+            # Do not keep SOLD positions in the Integration sheet
+            continue
+
+        # Otherwise, keep the position row
+        keep_rows.append([
             base,
             f"{pl_pct:.2f}",
             f"{qty:.10g}",
@@ -421,16 +385,27 @@ def run_once(kraken: KrakenClient, sheets: SheetClient):
             note
         ])
 
-    # 6) Write to sheet
-    sheets.write_tab(SHEET_KRAKEN_TAB, rows)
-    logging.info("Sheet updated.")
+    # 5) Write updated positions (SOLD removed)
+    sheets.write_tab(SHEET_KRAKEN_TAB, keep_rows)
+    logging.info("Positions sheet updated: %d active rows", len(keep_rows) - 1)
+
+    # 6) Append any trade logs
+    if trade_logs:
+        # Ensure header exists
+        df_existing = sheets.read_tab(SHEET_TRADES_TAB)
+        if df_existing.empty:
+            sheets.write_tab(SHEET_TRADES_TAB, [["Time","Action","Symbol","Quantity","Price","Mode","Note"]])
+        sheets.append_rows(SHEET_TRADES_TAB, trade_logs)
+        logging.info("Logged %d trade(s).", len(trade_logs))
 
 def main():
-    # Clients
+    # Safety: if keys missing, run in paper mode (won't crash)
+    if not (KRAKEN_KEY and KRAKEN_SECRET):
+        logging.warning("KRAKEN_API_KEY/SECRET missing. Running in PAPER mode.")
     sheets = SheetClient(GOOGLE_SHEET_NAME)
     kraken = KrakenClient(KRAKEN_KEY, KRAKEN_SECRET)
 
-    logging.info("Starting Kraken tracker & seller (LIVE_TRADING=%s)", LIVE_TRADING)
+    logging.info("Starting Kraken tracker & seller (LIVE_TRADING=%s)", LIVE_TRADING and bool(KRAKEN_KEY and KRAKEN_SECRET))
     while True:
         try:
             run_once(kraken, sheets)
