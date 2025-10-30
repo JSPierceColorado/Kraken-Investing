@@ -1,10 +1,10 @@
 """
-Kraken Crypto Data Bot (Railway-ready, single-file, resilient Stocktwits)
+Kraken Crypto Data Bot (Railway-ready, resilient Stocktwits + pure-pandas TA)
 
 Pipeline
 --------
 1) Discover Kraken base symbols tradable vs {QUOTE} (default: USD).
-2) Sanitize symbols for social APIs (A–Z/digits, length 2..10).
+2) Sanitize symbols (A–Z/digits, length 2..10, must contain at least one letter).
 3) Clear & write symbols to Google Sheet: Active-Investing → Crypto-Scrape.
 4) For each sanitized symbol, fetch Stocktwits messages robustly:
    - Try SYMBOL.X → SYMBOL → symbol search fallback.
@@ -15,14 +15,10 @@ Pipeline
 
 Environment Variables
 ---------------------
-GOOGLE_CREDS_JSON   (service account JSON with Editor access to the sheet)
-GOOGLE_SHEET_NAME   (default "Active-Investing")
-SHEET_TICKERS_TAB   (default "Crypto-Scrape")
-SHEET_SENTIMENT_TAB (default "Crypto-Sentiment")
-KRAKEN_BASE_PAIR    (default "USD")
-SENTIMENT_SOURCE    (default "stocktwits")
-MAX_TICKERS         (optional cap; default 50; set higher or unset to disable)
-HTTP_TIMEOUT        (default 20)
+GOOGLE_CREDS_JSON, GOOGLE_SHEET_NAME (default "Active-Investing"),
+SHEET_TICKERS_TAB (default "Crypto-Scrape"), SHEET_SENTIMENT_TAB (default "Crypto-Sentiment"),
+KRAKEN_BASE_PAIR (default "USD"), SENTIMENT_SOURCE (default "stocktwits"),
+MAX_TICKERS (optional cap; default 50; set higher or unset to disable), HTTP_TIMEOUT (default 20)
 """
 
 from __future__ import annotations
@@ -131,26 +127,35 @@ class KrakenClient:
     def get_ohlc_for_symbol(
         self, base_symbol: str, quote: str = "USD", interval: int = 60
     ) -> Optional[pd.DataFrame]:
-        """Fetch OHLC for base/quote (e.g., BTC/USD). Interval in minutes (1,5,15,60,240,1440...)."""
-        kraken_base = denormalize_to_kraken_base(base_symbol)
-        pair = f"{kraken_base}{quote.upper()}"  # Kraken accepts pair without slash e.g., XBTUSD
+        """Fetch OHLC for base/quote (e.g., BTC/USD). Returns DataFrame with datetime index."""
         try:
+            kraken_base = denormalize_to_kraken_base(base_symbol)
+            pair = f"{kraken_base}{quote.upper()}"  # e.g., XBTUSD
             data = self._get("OHLC", params={"pair": pair, "interval": interval})
-        except Exception:
-            return None
-        if not data:
-            return None
-        key = next(iter(data.keys()))
-        rows = data[key]
-        if not rows:
-            return None
+            if not data:
+                return None
 
-        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).tz_convert(None)
-        df.set_index("time", inplace=True)
-        for col in ["open", "high", "low", "close", "vwap", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+            # The result dict includes the pair key and a "last" key. Use the pair key only.
+            keys = [k for k in data.keys() if k != "last"]
+            if not keys:
+                return None
+            key = keys[0]
+            rows = data.get(key, [])
+            if not rows:
+                return None
+
+            df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
+            # Convert to tz-aware Series then drop tz (Series needs .dt.tz_convert)
+            dt = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
+            df["time"] = dt
+            df.set_index("time", inplace=True)
+
+            for col in ["open","high","low","close","vwap","volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
+        except Exception as e:
+            logging.warning("OHLC fetch/parse failed for %s/%s: %s", base_symbol, quote, e)
+            return None
 
 # Kraken symbol normalization (common mappings)
 NORMALIZE_MAP = {"XBT": "BTC", "XDG": "DOGE"}
@@ -232,7 +237,6 @@ class SentimentClient:
                 return None
 
             q_up = q.upper()
-
             # Prefer exact ".X" then exact, then contains, else first result
             for s in results:
                 sym = (s.get("symbol") or "").upper()
@@ -319,7 +323,8 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 # --------------------------
 # Symbol sanitizing
 # --------------------------
-SYMBOL_RE = re.compile(r"[A-Z0-9]{2,10}$")  # allow letters/digits, no 1-char, no punctuation
+# Require 2–10 chars, letters/digits only, and at least one letter
+SYMBOL_RE = re.compile(r"(?=.*[A-Z])[A-Z0-9]{2,10}$")
 
 def sanitize_symbols(symbols: List[str]) -> List[str]:
     out = []
@@ -365,8 +370,6 @@ def main():
     ]]
 
     errors: List[str] = []
-    processed = 0
-    with_sentiment = 0
 
     for sym in symbols:
         msgs = senti.fetch_messages_for_symbol(sym, limit=30)
@@ -389,16 +392,14 @@ def main():
             sym, agg["count"], agg["compound"], agg["pos"], agg["neg"], agg["neu"],
             ind["rsi14"], ind["ema20"], ind["sma50"], ind["momentum_up"]
         ])
-        with_sentiment += 1
-        processed += 1
-        # small delay to be gentle with both APIs
-        time.sleep(0.25)
+
+        time.sleep(0.25)  # be gentle with both APIs
 
     # 5) Write sentiment tab (only rows with sentiment)
     sheets.clear_and_write(SENTIMENT_TAB, out_rows)
     log(f"Wrote {len(out_rows)-1} rows to '{SENTIMENT_TAB}'. Done.")
 
-    # 6) Print an error summary (requested: "either fetch new data or send nothing AND an error")
+    # 6) Log error summary (no preloaded tickers; either fetch or log)
     if errors:
         log("\nError summary:")
         for e in errors:
