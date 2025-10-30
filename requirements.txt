@@ -1,7 +1,7 @@
+krakenex==2.1.0
 gspread==6.1.2
 google-auth==2.34.0
 pandas==2.3.2
 numpy>=2.3.0
-requests==2.32.3
 python-dateutil==2.9.0.post0
-nltk==3.9.1
+requests==2.32.3
