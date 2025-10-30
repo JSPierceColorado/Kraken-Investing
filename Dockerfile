@@ -8,11 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# (Optional but recommended) upgrade pip to get latest wheels/resolver
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
 
-# Pre-download VADER lexicon (safer syntax for Railway builds)
+# Pre-download VADER lexicon
 RUN python -m nltk.downloader vader_lexicon
 
 CMD ["python", "main.py"]
