@@ -1,28 +1,37 @@
 """
-Kraken Crypto Data Bot (Railway-ready, single-file, no pandas-ta)
+Kraken Crypto Data Bot (Railway-ready, single-file, resilient Stocktwits)
 
 Pipeline
 --------
 1) Discover Kraken base symbols tradable vs {QUOTE} (default: USD).
-2) Clear & write symbols to Google Sheet: Active-Investing → Crypto-Scrape.
-3) Pull Stocktwits messages per symbol:
-   - If none, skip (not added to Crypto-Sentiment).
-4) For symbols with sentiment, fetch Kraken OHLC (60m) and compute:
+2) Sanitize symbols for social APIs (A–Z/digits, length 2..10).
+3) Clear & write symbols to Google Sheet: Active-Investing → Crypto-Scrape.
+4) For each sanitized symbol, fetch Stocktwits messages robustly:
+   - Try SYMBOL.X → SYMBOL → symbol search fallback.
+   - If still no messages or HTTP errors, SKIP and LOG an error.
+5) For symbols with sentiment, fetch Kraken OHLC (60m) and compute:
    - RSI(14) [Wilder], EMA(20), SMA(50), momentum_up (close_now > close_20ago)
-5) Write results to Active-Investing → Crypto-Sentiment.
+6) Write results to Active-Investing → Crypto-Sentiment (only rows with sentiment).
 
-Env
----
-GOOGLE_CREDS_JSON (service account JSON), GOOGLE_SHEET_NAME (default Active-Investing),
-SHEET_TICKERS_TAB (default Crypto-Scrape), SHEET_SENTIMENT_TAB (default Crypto-Sentiment),
-KRAKEN_BASE_PAIR (default USD), SENTIMENT_SOURCE (default stocktwits),
-MAX_TICKERS (default 50), HTTP_TIMEOUT (default 20)
+Environment Variables
+---------------------
+GOOGLE_CREDS_JSON   (service account JSON with Editor access to the sheet)
+GOOGLE_SHEET_NAME   (default "Active-Investing")
+SHEET_TICKERS_TAB   (default "Crypto-Scrape")
+SHEET_SENTIMENT_TAB (default "Crypto-Sentiment")
+KRAKEN_BASE_PAIR    (default "USD")
+SENTIMENT_SOURCE    (default "stocktwits")
+MAX_TICKERS         (optional cap; default 50; set higher or unset to disable)
+HTTP_TIMEOUT        (default 20)
 """
 
 from __future__ import annotations
 
 import os
 import json
+import re
+import time
+import logging
 from typing import Dict, List, Optional, Set
 
 import requests
@@ -32,7 +41,7 @@ import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Sentiment (VADER)
+# --- Sentiment (VADER) ---
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 try:
@@ -50,6 +59,8 @@ TICKERS_TAB = os.getenv("SHEET_TICKERS_TAB", "Crypto-Scrape")
 SENTIMENT_TAB = os.getenv("SHEET_SENTIMENT_TAB", "Crypto-Sentiment")
 BASE_PAIR = os.getenv("KRAKEN_BASE_PAIR", "USD").upper()
 SENTIMENT_SOURCE = os.getenv("SENTIMENT_SOURCE", "stocktwits").lower()
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -77,14 +88,14 @@ class SheetClient:
         self.sheet = self.gc.open(sheet_name)
 
     def clear_and_write(self, tab_name: str, rows: List[List]):
-        import gspread  # for exception
         try:
             ws = self.sheet.worksheet(tab_name)
         except gspread.WorksheetNotFound:
             ws = self.sheet.add_worksheet(title=tab_name, rows="1000", cols="26")
         ws.clear()
         if rows:
-            ws.update("A1", rows, value_input_option="RAW")
+            # Fix deprecation: values first, then range_name
+            ws.update(rows, "A1", value_input_option="RAW")
 
 # --------------------------
 # Kraken API
@@ -102,9 +113,11 @@ class KrakenClient:
         return data["result"]
 
     def list_base_assets_with_quote(self, base_pair: str = "USD") -> Set[str]:
+        """Return normalized base symbols that have a pair with the given quote (e.g., USD)."""
         pairs = self._get("AssetPairs")
         result: Set[str] = set()
         quote = base_pair.upper()
+
         for _, info in pairs.items():
             wsname = info.get("wsname")  # e.g., "XBT/USD"
             if not wsname or "/" not in wsname:
@@ -118,8 +131,9 @@ class KrakenClient:
     def get_ohlc_for_symbol(
         self, base_symbol: str, quote: str = "USD", interval: int = 60
     ) -> Optional[pd.DataFrame]:
+        """Fetch OHLC for base/quote (e.g., BTC/USD). Interval in minutes (1,5,15,60,240,1440...)."""
         kraken_base = denormalize_to_kraken_base(base_symbol)
-        pair = f"{kraken_base}{quote.upper()}"
+        pair = f"{kraken_base}{quote.upper()}"  # Kraken accepts pair without slash e.g., XBTUSD
         try:
             data = self._get("OHLC", params={"pair": pair, "interval": interval})
         except Exception:
@@ -131,14 +145,14 @@ class KrakenClient:
         if not rows:
             return None
 
-        df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
+        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).tz_convert(None)
         df.set_index("time", inplace=True)
-        for col in ["open","high","low","close","vwap","volume"]:
+        for col in ["open", "high", "low", "close", "vwap", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
 
-# Symbol normalization
+# Kraken symbol normalization (common mappings)
 NORMALIZE_MAP = {"XBT": "BTC", "XDG": "DOGE"}
 DENORMALIZE_MAP = {"BTC": "XBT", "DOGE": "XDG"}
 
@@ -151,36 +165,91 @@ def denormalize_to_kraken_base(sym: str) -> str:
     return DENORMALIZE_MAP.get(s, s)
 
 # --------------------------
-# Sentiment
+# Sentiment (resilient Stocktwits)
 # --------------------------
 class SentimentClient:
     def __init__(self, source: str = "stocktwits"):
         self.source = (source or "stocktwits").lower()
         self.analyzer = SentimentIntensityAnalyzer()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; CryptoBot/1.0; +https://example.com)",
+            "Accept": "application/json",
+        })
 
     def fetch_messages_for_symbol(self, symbol: str, limit: int = 30) -> List[str]:
-        if self.source == "stocktwits":
-            return self._stocktwits_messages(symbol, limit=limit)
+        """Return up to `limit` message texts for a symbol or [] if not available."""
+        if self.source != "stocktwits":
+            return []
+
+        # 1) try direct crypto cashtags
+        for sym in (f"{symbol}.X", symbol):
+            msgs = self._fetch_sw_stream(sym, limit)
+            if msgs:
+                return msgs
+            time.sleep(0.35)  # gentle pacing helps with 429s
+
+        # 2) search fallback
+        found = self._search_sw_symbol(symbol)
+        if found:
+            msgs = self._fetch_sw_stream(found, limit)
+            if msgs:
+                return msgs
+
         return []
 
-    def _stocktwits_messages(self, symbol: str, limit: int = 30) -> List[str]:
-        msgs: List[str] = []
-        for sym in (f"{symbol}.X", symbol):  # many crypto streams use BTC.X
-            try:
-                url = f"https://api.stocktwits.com/api/2/streams/symbol/{sym}.json"
-                r = requests.get(url, timeout=HTTP_TIMEOUT)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                for m in data.get("messages", [])[:limit]:
-                    body = (m.get("body") or "").strip()
-                    if body:
-                        msgs.append(body)
-                if msgs:
-                    break
-            except Exception:
-                continue
-        return msgs
+    def _fetch_sw_stream(self, sym: str, limit: int) -> List[str]:
+        import urllib.parse
+        url = f"https://api.stocktwits.com/api/2/streams/symbol/{urllib.parse.quote(sym)}.json"
+        try:
+            r = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                logging.warning("Stocktwits stream %s -> HTTP %s", sym, r.status_code)
+                return []
+            data = r.json()
+            out = []
+            for m in data.get("messages", [])[:limit]:
+                body = (m.get("body") or "").strip()
+                if body:
+                    out.append(body)
+            return out
+        except Exception as e:
+            logging.warning("Stocktwits error for %s: %s", sym, e)
+            return []
+
+    def _search_sw_symbol(self, q: str) -> Optional[str]:
+        """Return the best Stocktwits symbol string to use in /streams/symbol, or None."""
+        import urllib.parse
+        url = f"https://api.stocktwits.com/api/2/search/symbols.json?q={urllib.parse.quote(q)}"
+        try:
+            r = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                logging.warning("Stocktwits search %s -> HTTP %s", q, r.status_code)
+                return None
+            data = r.json()
+            results = data.get("symbols", []) or []
+            if not results:
+                return None
+
+            q_up = q.upper()
+
+            # Prefer exact ".X" then exact, then contains, else first result
+            for s in results:
+                sym = (s.get("symbol") or "").upper()
+                if sym == f"{q_up}.X":
+                    return sym
+            for s in results:
+                sym = (s.get("symbol") or "").upper()
+                if sym == q_up:
+                    return sym
+            for s in results:
+                sym = (s.get("symbol") or "").upper()
+                if q_up in sym:
+                    return sym
+            return (results[0].get("symbol") or "").upper()
+        except Exception as e:
+            logging.warning("Stocktwits search error for %s: %s", q, e)
+            return None
 
     def aggregate_vader(self, messages: List[str]) -> Dict[str, float]:
         if not messages:
@@ -248,6 +317,21 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     return out
 
 # --------------------------
+# Symbol sanitizing
+# --------------------------
+SYMBOL_RE = re.compile(r"[A-Z0-9]{2,10}$")  # allow letters/digits, no 1-char, no punctuation
+
+def sanitize_symbols(symbols: List[str]) -> List[str]:
+    out = []
+    for s in symbols:
+        u = s.upper()
+        if SYMBOL_RE.fullmatch(u):
+            out.append(u)
+        else:
+            logging.info("Dropping non-social-friendly symbol: %s", s)
+    return out
+
+# --------------------------
 # Main
 # --------------------------
 def main():
@@ -261,31 +345,42 @@ def main():
     if not symbols:
         log("No symbols discovered. Exiting.")
         return
+
+    # Optional max cap
     if MAX_TICKERS and len(symbols) > MAX_TICKERS:
         symbols = symbols[:MAX_TICKERS]
-    log(f"Found {len(symbols)} symbols. Example: {symbols[:10]}")
 
-    # 2) Write tickers tab
+    # 2) Sanitize for Stocktwits-style cashtags
+    symbols = sanitize_symbols(symbols)
+    log(f"Using {len(symbols)} sanitized symbols. Example: {symbols[:10]}")
+
+    # 3) Write tickers tab
     sheets.clear_and_write(TICKERS_TAB, [["symbol"]] + [[s] for s in symbols])
     log(f"Wrote {len(symbols)} symbols to '{TICKERS_TAB}'.")
 
-    # 3) Build sentiment+indicators rows
+    # 4) Build sentiment+indicators rows
     out_rows: List[List] = [[
         "symbol", "messages", "avg_compound", "avg_pos", "avg_neg", "avg_neu",
         "rsi14", "ema20", "sma50", "momentum_up"
     ]]
 
+    errors: List[str] = []
+    processed = 0
+    with_sentiment = 0
+
     for sym in symbols:
-        msgs = senti.fetch_messages_for_symbol(sym)
+        msgs = senti.fetch_messages_for_symbol(sym, limit=30)
         if not msgs:
-            log(f"[{sym}] No Stocktwits messages → skipping.")
+            msg = f"[{sym}] No Stocktwits messages (or fetch error) → skipping."
+            log(msg)
+            errors.append(msg)
             continue
 
         agg = senti.aggregate_vader(msgs)
 
         ohlc = kraken.get_ohlc_for_symbol(sym, quote=BASE_PAIR, interval=60)
         if ohlc is None or ohlc.empty:
-            log(f"[{sym}] No OHLC data; technicals blank.")
+            logging.info("[%s] No OHLC data; technicals blank.", sym)
             ind = {"rsi14": None, "ema20": None, "sma50": None, "momentum_up": None}
         else:
             ind = compute_indicators(ohlc)
@@ -294,10 +389,20 @@ def main():
             sym, agg["count"], agg["compound"], agg["pos"], agg["neg"], agg["neu"],
             ind["rsi14"], ind["ema20"], ind["sma50"], ind["momentum_up"]
         ])
+        with_sentiment += 1
+        processed += 1
+        # small delay to be gentle with both APIs
+        time.sleep(0.25)
 
-    # 4) Write sentiment tab
+    # 5) Write sentiment tab (only rows with sentiment)
     sheets.clear_and_write(SENTIMENT_TAB, out_rows)
     log(f"Wrote {len(out_rows)-1} rows to '{SENTIMENT_TAB}'. Done.")
+
+    # 6) Print an error summary (requested: "either fetch new data or send nothing AND an error")
+    if errors:
+        log("\nError summary:")
+        for e in errors:
+            log(f" - {e}")
 
 if __name__ == "__main__":
     main()
