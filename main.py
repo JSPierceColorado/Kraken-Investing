@@ -1,39 +1,29 @@
 """
-Kraken Crypto Data Bot (Railway-ready, resilient Stocktwits + pure-pandas TA)
+Pipeline:
+  Stocktwits universe (search) -> messages -> VADER sentiment
+  -> Kraken OHLC -> TA (RSI14, EMA20, SMA50, momentum_up)
+  -> Write only fully-successful rows to Crypto-Sentiment
 
-Pipeline
---------
-1) Discover Kraken base symbols tradable vs {QUOTE} (default: USD).
-2) Sanitize symbols (A–Z/digits, length 2..10, must contain at least one letter).
-3) Clear & write symbols to Google Sheet: Active-Investing → Crypto-Scrape.
-4) For each sanitized symbol, fetch Stocktwits messages robustly:
-   - Try SYMBOL.X → SYMBOL → symbol search fallback.
-   - If still no messages or HTTP errors, SKIP and LOG an error.
-5) For symbols with sentiment, fetch Kraken OHLC (60m) and compute:
-   - RSI(14) [Wilder], EMA(20), SMA(50), momentum_up (close_now > close_20ago)
-6) Write results to Active-Investing → Crypto-Sentiment (only rows with sentiment).
-
-Environment Variables
----------------------
-GOOGLE_CREDS_JSON, GOOGLE_SHEET_NAME (default "Active-Investing"),
-SHEET_TICKERS_TAB (default "Crypto-Scrape"), SHEET_SENTIMENT_TAB (default "Crypto-Sentiment"),
-KRAKEN_BASE_PAIR (default "USD"), SENTIMENT_SOURCE (default "stocktwits"),
-MAX_TICKERS (optional cap; default 50; set higher or unset to disable), HTTP_TIMEOUT (default 20)
+Env:
+  GOOGLE_CREDS_JSON  (service account JSON)
+  GOOGLE_SHEET_NAME  (default Active-Investing)
+  SHEET_TICKERS_TAB  (default Crypto-Scrape)       # will list discovered Stocktwits crypto symbols (slugs)
+  SHEET_SENTIMENT_TAB(default Crypto-Sentiment)
+  KRAKEN_BASE_PAIR   (default USD)
+  HTTP_TIMEOUT       (default 20)
+  MAX_STW_SYMBOLS    (optional cap for discovered STW symbols, default 500)
+  MESSAGES_PER_SYMBOL(default 30)
+  RATE_SLEEP_SEC     (default 0.35)
 """
 
 from __future__ import annotations
 
-import os
-import json
-import re
-import time
-import logging
+import os, json, re, time, logging
 from typing import Dict, List, Optional, Set
 
 import requests
 import pandas as pd
 import numpy as np
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -46,52 +36,43 @@ except LookupError:
     nltk.download("vader_lexicon")
 
 # --------------------------
-# Config & helpers
+# Config
 # --------------------------
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "50"))
 DEFAULT_SHEET = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
 TICKERS_TAB = os.getenv("SHEET_TICKERS_TAB", "Crypto-Scrape")
 SENTIMENT_TAB = os.getenv("SHEET_SENTIMENT_TAB", "Crypto-Sentiment")
 BASE_PAIR = os.getenv("KRAKEN_BASE_PAIR", "USD").upper()
-SENTIMENT_SOURCE = os.getenv("SENTIMENT_SOURCE", "stocktwits").lower()
+
+MAX_STW_SYMBOLS = int(os.getenv("MAX_STW_SYMBOLS", "500"))
+MESSAGES_PER_SYMBOL = int(os.getenv("MESSAGES_PER_SYMBOL", "30"))
+RATE_SLEEP_SEC = float(os.getenv("RATE_SLEEP_SEC", "0.35"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def log(msg: str): print(msg, flush=True)
 
 # --------------------------
-# Google Sheets client
+# Google Sheets
 # --------------------------
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 class SheetClient:
     def __init__(self, sheet_name: str):
         creds_json = os.getenv("GOOGLE_CREDS_JSON")
-        if not creds_json:
-            raise RuntimeError("GOOGLE_CREDS_JSON is missing.")
-        try:
-            sa_info = json.loads(creds_json)
-        except Exception as e:
-            raise RuntimeError("GOOGLE_CREDS_JSON must be valid JSON.") from e
-
+        if not creds_json: raise RuntimeError("GOOGLE_CREDS_JSON is missing.")
+        sa_info = json.loads(creds_json)
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
         self.sheet = self.gc.open(sheet_name)
 
-    def clear_and_write(self, tab_name: str, rows: List[List]):
+    def clear_and_write(self, tab: str, rows: List[List]):
         try:
-            ws = self.sheet.worksheet(tab_name)
+            ws = self.sheet.worksheet(tab)
         except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=tab_name, rows="1000", cols="26")
+            ws = self.sheet.add_worksheet(title=tab, rows="2000", cols="26")
         ws.clear()
         if rows:
-            # Fix deprecation: values first, then range_name
-            ws.update(rows, "A1", value_input_option="RAW")
+            ws.update(rows, "A1", value_input_option="RAW")  # values first (fix deprecation)
 
 # --------------------------
 # Kraken API
@@ -100,240 +81,124 @@ class KrakenClient:
     BASE = "https://api.kraken.com/0/public"
 
     def _get(self, path: str, params: Optional[dict] = None):
-        url = f"{self.BASE}/{path}"
-        r = requests.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
+        r = requests.get(f"{self.BASE}/{path}", params=params or {}, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        if data.get("error"):
-            raise RuntimeError(f"Kraken error: {data['error']}")
+        if data.get("error"): raise RuntimeError(f"Kraken error: {data['error']}")
         return data["result"]
 
-    def list_base_assets_with_quote(self, base_pair: str = "USD") -> Set[str]:
-        """Return normalized base symbols that have a pair with the given quote (e.g., USD)."""
-        pairs = self._get("AssetPairs")
-        result: Set[str] = set()
-        quote = base_pair.upper()
-
-        for _, info in pairs.items():
-            wsname = info.get("wsname")  # e.g., "XBT/USD"
-            if not wsname or "/" not in wsname:
-                continue
-            base, q = wsname.split("/")
-            if q.upper() != quote:
-                continue
-            result.add(normalize_base_symbol(base))
-        return result
-
-    def get_ohlc_for_symbol(
-        self, base_symbol: str, quote: str = "USD", interval: int = 60
-    ) -> Optional[pd.DataFrame]:
-        """Fetch OHLC for base/quote (e.g., BTC/USD). Returns DataFrame with datetime index."""
+    def get_ohlc_for_symbol(self, base_symbol: str, quote: str = "USD", interval: int = 60) -> Optional[pd.DataFrame]:
+        # Kraken uses e.g. XBT for BTC, XDG for DOGE
+        kraken_base = {"BTC":"XBT","DOGE":"XDG"}.get(base_symbol.upper(), base_symbol.upper())
+        pair = f"{kraken_base}{quote.upper()}"
         try:
-            kraken_base = denormalize_to_kraken_base(base_symbol)
-            pair = f"{kraken_base}{quote.upper()}"  # e.g., XBTUSD
             data = self._get("OHLC", params={"pair": pair, "interval": interval})
-            if not data:
-                return None
-
-            # The result dict includes the pair key and a "last" key. Use the pair key only.
+            if not data: return None
             keys = [k for k in data.keys() if k != "last"]
-            if not keys:
-                return None
-            key = keys[0]
-            rows = data.get(key, [])
-            if not rows:
-                return None
-
+            if not keys: return None
+            rows = data.get(keys[0], [])
+            if not rows: return None
             df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
-            # Convert to tz-aware Series then drop tz (Series needs .dt.tz_convert)
-            dt = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
-            df["time"] = dt
+            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
             df.set_index("time", inplace=True)
-
-            for col in ["open","high","low","close","vwap","volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            for c in ["open","high","low","close","vwap","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
             return df
         except Exception as e:
-            logging.warning("OHLC fetch/parse failed for %s/%s: %s", base_symbol, quote, e)
+            logging.info("Kraken OHLC fail for %s/%s: %s", base_symbol, quote, e)
             return None
 
-# Kraken symbol normalization (common mappings)
-NORMALIZE_MAP = {"XBT": "BTC", "XDG": "DOGE"}
-DENORMALIZE_MAP = {"BTC": "XBT", "DOGE": "XDG"}
-
-def normalize_base_symbol(base: str) -> str:
-    b = base.upper()
-    return NORMALIZE_MAP.get(b, b)
-
-def denormalize_to_kraken_base(sym: str) -> str:
-    s = sym.upper()
-    return DENORMALIZE_MAP.get(s, s)
-
 # --------------------------
-# Sentiment (resilient Stocktwits)
+# Stocktwits client
 # --------------------------
-class SentimentClient:
-    def __init__(self, source: str = "stocktwits"):
-        self.source = (source or "stocktwits").lower()
-        self.analyzer = SentimentIntensityAnalyzer()
-        self.session = requests.Session()
-        self.session.headers.update({
+SYMBOL_RE = re.compile(r"(?=.*[A-Z])[A-Z0-9]{2,10}$")
+FIAT = {"USD","EUR","AUD","GBP","JPY","CAD","CHF","CNY","CNH","NZD","SEK","NOK","DKK","HKD","SGD","ZAR","MXN"}
+
+class StocktwitsClient:
+    BASE = "https://api.stocktwits.com/api/2"
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; CryptoBot/1.0; +https://example.com)",
             "Accept": "application/json",
         })
 
-    def fetch_messages_for_symbol(self, symbol: str, limit: int = 30) -> List[str]:
-        """Return up to `limit` message texts for a symbol or [] if not available."""
-        if self.source != "stocktwits":
-            return []
-
-        # 1) try direct crypto cashtags
-        for sym in (f"{symbol}.X", symbol):
-            msgs = self._fetch_sw_stream(sym, limit)
-            if msgs:
-                return msgs
-            time.sleep(0.35)  # gentle pacing helps with 429s
-
-        # 2) search fallback
-        found = self._search_sw_symbol(symbol)
-        if found:
-            msgs = self._fetch_sw_stream(found, limit)
-            if msgs:
-                return msgs
-
-        return []
-
-    def _fetch_sw_stream(self, sym: str, limit: int) -> List[str]:
-        import urllib.parse
-        url = f"https://api.stocktwits.com/api/2/streams/symbol/{urllib.parse.quote(sym)}.json"
+    def _get(self, path: str, params: Optional[dict]=None) -> Optional[dict]:
         try:
-            r = self.session.get(url, timeout=HTTP_TIMEOUT)
+            r = self.s.get(f"{self.BASE}/{path}", params=params or {}, timeout=HTTP_TIMEOUT)
             if r.status_code != 200:
-                logging.warning("Stocktwits stream %s -> HTTP %s", sym, r.status_code)
-                return []
-            data = r.json()
-            out = []
-            for m in data.get("messages", [])[:limit]:
-                body = (m.get("body") or "").strip()
-                if body:
-                    out.append(body)
-            return out
-        except Exception as e:
-            logging.warning("Stocktwits error for %s: %s", sym, e)
-            return []
-
-    def _search_sw_symbol(self, q: str) -> Optional[str]:
-        """Return the best Stocktwits symbol string to use in /streams/symbol, or None."""
-        import urllib.parse
-        url = f"https://api.stocktwits.com/api/2/search/symbols.json?q={urllib.parse.quote(q)}"
-        try:
-            r = self.session.get(url, timeout=HTTP_TIMEOUT)
-            if r.status_code != 200:
-                logging.warning("Stocktwits search %s -> HTTP %s", q, r.status_code)
+                logging.info("Stocktwits GET %s -> %s", path, r.status_code)
                 return None
-            data = r.json()
-            results = data.get("symbols", []) or []
-            if not results:
-                return None
-
-            q_up = q.upper()
-            # Prefer exact ".X" then exact, then contains, else first result
-            for s in results:
-                sym = (s.get("symbol") or "").upper()
-                if sym == f"{q_up}.X":
-                    return sym
-            for s in results:
-                sym = (s.get("symbol") or "").upper()
-                if sym == q_up:
-                    return sym
-            for s in results:
-                sym = (s.get("symbol") or "").upper()
-                if q_up in sym:
-                    return sym
-            return (results[0].get("symbol") or "").upper()
+            return r.json()
         except Exception as e:
-            logging.warning("Stocktwits search error for %s: %s", q, e)
+            logging.info("Stocktwits GET error %s: %s", path, e)
             return None
 
-    def aggregate_vader(self, messages: List[str]) -> Dict[str, float]:
-        if not messages:
-            return {"count": 0, "compound": 0.0, "pos": 0.0, "neg": 0.0, "neu": 0.0}
-        comps, poss, negs, neus = [], [], [], []
-        for t in messages:
-            s = self.analyzer.polarity_scores(t)
-            comps.append(s["compound"])
-            poss.append(s["pos"])
-            negs.append(s["neg"])
-            neus.append(s["neu"])
-        n = len(messages)
-        return {
-            "count": n,
-            "compound": round(sum(comps) / n, 4),
-            "pos": round(sum(poss) / n, 4),
-            "neg": round(sum(negs) / n, 4),
-            "neu": round(sum(neus) / n, 4),
-        }
+    def discover_crypto_symbols(self, cap: int = 500) -> List[str]:
+        """
+        Heuristic discovery: sweep search queries to collect crypto symbols.
+        No hardcoded tickers; uses alphanumeric sweeps.
+        """
+        queries = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        seen: Set[str] = set()
+        out: List[str] = []
+        for q in queries:
+            data = self._get("search/symbols.json", {"q": q})
+            time.sleep(RATE_SLEEP_SEC)
+            if not data: continue
+            for s in data.get("symbols", []) or []:
+                sym = (s.get("symbol") or "").upper()
+                # Prefer only crypto-like results; Stocktwits 'type' varies (e.g., "cryptocurrency", "crypto")
+                typ = (s.get("type") or "").lower()
+                if typ and "crypto" not in typ:
+                    continue
+                if not SYMBOL_RE.fullmatch(sym):  # basic hygiene
+                    continue
+                if sym in FIAT:  # skip fiat codes
+                    continue
+                if sym not in seen:
+                    seen.add(sym)
+                    out.append(sym)
+                    if len(out) >= cap:
+                        return out
+        return out
+
+    def fetch_messages(self, slug: str, limit: int = 30) -> List[str]:
+        data = self._get(f"streams/symbol/{slug}.json")
+        if not data: return []
+        msgs = []
+        for m in data.get("messages", [])[:limit]:
+            t = (m.get("body") or "").strip()
+            if t: msgs.append(t)
+        return msgs
 
 # --------------------------
-# Technical indicators (pure pandas)
+# TA (pure pandas)
 # --------------------------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
-
 def sma(series: pd.Series, length: int) -> pd.Series:
     return series.rolling(window=length, min_periods=length).mean()
-
 def rsi_wilder(series: pd.Series, length: int = 14) -> pd.Series:
-    """
-    Wilder's RSI:
-    - RS = smoothed_avg_gain / smoothed_avg_loss
-    - RSI = 100 - (100 / (1 + RS))
-    """
     delta = series.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
-
     avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
     avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def compute_indicators(df: pd.DataFrame) -> dict:
-    out: Dict[str, object] = {"rsi14": None, "ema20": None, "sma50": None, "momentum_up": None}
-    if df is None or df.empty:
-        return out
-
+    out = {"rsi14": None, "ema20": None, "sma50": None, "momentum_up": None}
+    if df is None or df.empty: return out
     close = df["close"].astype(float)
-
-    rsi14_series = rsi_wilder(close, length=14).dropna()
-    ema20_series = ema(close, length=20).dropna()
-    sma50_series = sma(close, length=50).dropna()
-
-    out["rsi14"] = round(float(rsi14_series.iloc[-1]), 2) if not rsi14_series.empty else None
-    out["ema20"] = round(float(ema20_series.iloc[-1]), 6) if not ema20_series.empty else None
-    out["sma50"] = round(float(sma50_series.iloc[-1]), 6) if not sma50_series.empty else None
-
-    if len(close) >= 21 and close.iloc[-21] is not None:
-        out["momentum_up"] = bool(close.iloc[-1] > close.iloc[-21])
-
-    return out
-
-# --------------------------
-# Symbol sanitizing
-# --------------------------
-# Require 2–10 chars, letters/digits only, and at least one letter
-SYMBOL_RE = re.compile(r"(?=.*[A-Z])[A-Z0-9]{2,10}$")
-
-def sanitize_symbols(symbols: List[str]) -> List[str]:
-    out = []
-    for s in symbols:
-        u = s.upper()
-        if SYMBOL_RE.fullmatch(u):
-            out.append(u)
-        else:
-            logging.info("Dropping non-social-friendly symbol: %s", s)
+    rsi14 = rsi_wilder(close, 14).dropna()
+    ema20 = ema(close, 20).dropna()
+    sma50 = sma(close, 50).dropna()
+    out["rsi14"] = round(float(rsi14.iloc[-1]), 2) if not rsi14.empty else None
+    out["ema20"] = round(float(ema20.iloc[-1]), 6) if not ema20.empty else None
+    out["sma50"] = round(float(sma50.iloc[-1]), 6) if not sma50.empty else None
+    out["momentum_up"] = bool(close.iloc[-1] > close.iloc[-21]) if len(close) >= 21 else None
     return out
 
 # --------------------------
@@ -341,69 +206,72 @@ def sanitize_symbols(symbols: List[str]) -> List[str]:
 # --------------------------
 def main():
     sheets = SheetClient(DEFAULT_SHEET)
+    stw = StocktwitsClient()
     kraken = KrakenClient()
-    senti = SentimentClient(source=SENTIMENT_SOURCE)
+    vader = SentimentIntensityAnalyzer()
 
-    # 1) Discover symbols
-    log(f"Fetching Kraken assets with {BASE_PAIR} pairs…")
-    symbols = sorted(list(kraken.list_base_assets_with_quote(base_pair=BASE_PAIR)))
-    if not symbols:
-        log("No symbols discovered. Exiting.")
+    # 1) Discover Stocktwits crypto symbols (slugs)
+    log("Discovering crypto symbols from Stocktwits…")
+    stw_syms = stw.discover_crypto_symbols(cap=MAX_STW_SYMBOLS)
+    if not stw_syms:
+        log("No Stocktwits crypto symbols discovered. Exiting.")
         return
+    log(f"Discovered {len(stw_syms)} symbols. Example: {stw_syms[:12]}")
 
-    # Optional max cap
-    if MAX_TICKERS and len(symbols) > MAX_TICKERS:
-        symbols = symbols[:MAX_TICKERS]
+    # Write discovery inventory to Crypto-Scrape
+    sheets.clear_and_write(TICKERS_TAB, [["stw_symbol"]] + [[s] for s in sorted(stw_syms)])
+    log(f"Wrote {len(stw_syms)} Stocktwits crypto symbols to '{TICKERS_TAB}'.")
 
-    # 2) Sanitize for Stocktwits-style cashtags
-    symbols = sanitize_symbols(symbols)
-    log(f"Using {len(symbols)} sanitized symbols. Example: {symbols[:10]}")
-
-    # 3) Write tickers tab
-    sheets.clear_and_write(TICKERS_TAB, [["symbol"]] + [[s] for s in symbols])
-    log(f"Wrote {len(symbols)} symbols to '{TICKERS_TAB}'.")
-
-    # 4) Build sentiment+indicators rows
-    out_rows: List[List] = [[
+    # 2) For each symbol: fetch messages & sentiment
+    results: List[List] = [[
         "symbol", "messages", "avg_compound", "avg_pos", "avg_neg", "avg_neu",
         "rsi14", "ema20", "sma50", "momentum_up"
     ]]
 
-    errors: List[str] = []
-
-    for sym in symbols:
-        msgs = senti.fetch_messages_for_symbol(sym, limit=30)
+    for slug in stw_syms:
+        # messages
+        msgs = stw.fetch_messages(slug, limit=MESSAGES_PER_SYMBOL)
+        time.sleep(RATE_SLEEP_SEC)
         if not msgs:
-            msg = f"[{sym}] No Stocktwits messages (or fetch error) → skipping."
-            log(msg)
-            errors.append(msg)
+            logging.info("[%s] No Stocktwits messages -> skip", slug)
             continue
 
-        agg = senti.aggregate_vader(msgs)
+        # sentiment
+        comps=poss=negs=neus=0.0
+        for t in msgs:
+            s = vader.polarity_scores(t)
+            comps += s["compound"]; poss += s["pos"]; negs += s["neg"]; neus += s["neu"]
+        n = float(len(msgs))
+        agg = {
+            "count": int(n),
+            "compound": round(comps/n, 4),
+            "pos": round(poss/n, 4),
+            "neg": round(negs/n, 4),
+            "neu": round(neus/n, 4),
+        }
 
-        ohlc = kraken.get_ohlc_for_symbol(sym, quote=BASE_PAIR, interval=60)
+        # Map to Kraken base symbol: strip trailing ".X" if present
+        base = slug[:-2] if slug.endswith(".X") else slug
+        # Skip obvious non-crypto fiat leftovers
+        if base.upper() in FIAT: 
+            logging.info("[%s] Looks fiat -> skip", slug)
+            continue
+
+        # 3) Kraken OHLC + TA
+        ohlc = kraken.get_ohlc_for_symbol(base, quote=BASE_PAIR, interval=60)
         if ohlc is None or ohlc.empty:
-            logging.info("[%s] No OHLC data; technicals blank.", sym)
-            ind = {"rsi14": None, "ema20": None, "sma50": None, "momentum_up": None}
-        else:
-            ind = compute_indicators(ohlc)
+            logging.info("[%s] No Kraken OHLC -> skip", slug)
+            continue
 
-        out_rows.append([
-            sym, agg["count"], agg["compound"], agg["pos"], agg["neg"], agg["neu"],
+        ind = compute_indicators(ohlc)
+        results.append([
+            base, agg["count"], agg["compound"], agg["pos"], agg["neg"], agg["neu"],
             ind["rsi14"], ind["ema20"], ind["sma50"], ind["momentum_up"]
         ])
 
-        time.sleep(0.25)  # be gentle with both APIs
-
-    # 5) Write sentiment tab (only rows with sentiment)
-    sheets.clear_and_write(SENTIMENT_TAB, out_rows)
-    log(f"Wrote {len(out_rows)-1} rows to '{SENTIMENT_TAB}'. Done.")
-
-    # 6) Log error summary (no preloaded tickers; either fetch or log)
-    if errors:
-        log("\nError summary:")
-        for e in errors:
-            log(f" - {e}")
+    # 4) Write only fully successful rows
+    sheets.clear_and_write(SENTIMENT_TAB, results)
+    log(f"Wrote {len(results)-1} rows to '{SENTIMENT_TAB}'. Done.")
 
 if __name__ == "__main__":
     main()
